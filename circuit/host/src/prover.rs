@@ -1,10 +1,10 @@
 //! Host prover for LP-0002 private multisig.
 
 use anyhow::Result;
-use risc0_zkvm::{ExecutorEnv, ProverOpts, Receipt};
+use risc0_zkvm::{ExecutorEnv, Receipt};
 use serde::{Deserialize, Serialize};
 
-include!(concat!(env!("OUT_DIR"), "/methods.rs"));
+use crate::methods::PRIVATE_MULTISIG_GUEST_ELF;
 
 #[derive(Serialize, Deserialize)]
 pub struct ProverInput {
@@ -20,10 +20,6 @@ pub fn prove(input: ProverInput) -> Result<Receipt> {
         .write(&input)?
         .build()?;
     let prover = risc0_zkvm::default_prover();
-    let receipt = prover.prove_with_opts(
-        env,
-        PRIVATE_MULTISIG_GUEST_ELF,
-        &ProverOpts::groth16(),
-    )?.receipt;
+    let receipt = prover.prove(env, PRIVATE_MULTISIG_GUEST_ELF)?.receipt;
     Ok(receipt)
 }

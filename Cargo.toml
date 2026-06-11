@@ -2,7 +2,8 @@
 members = [
     "circuit/guest",
     "circuit/host",
-    "programs/multisig",
     "sdk",
 ]
+# programs/multisig depends on nssa-core (private LEZ dep) -- not compilable standalone
+exclude = ["programs/multisig"]
 resolver = "2"
