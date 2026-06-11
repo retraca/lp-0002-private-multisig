@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Private Multisig — LP-0002</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 640px; margin: 2rem auto; padding: 0 1rem; }
+    h1 { font-size: 1.25rem; }
+    .section { margin: 1.5rem 0; }
+    label { display: block; font-size: 0.85rem; margin-bottom: 0.25rem; color: #555; }
+    input, textarea { width: 100%; box-sizing: border-box; padding: 0.4rem; font-family: monospace; font-size: 0.85rem; border: 1px solid #ccc; border-radius: 4px; }
+    button { margin-top: 0.5rem; padding: 0.4rem 1rem; cursor: pointer; }
+    pre { background: #f5f5f5; padding: 0.75rem; border-radius: 4px; font-size: 0.8rem; overflow-x: auto; white-space: pre-wrap; word-break: break-all; }
+    .note { font-size: 0.8rem; color: #777; margin-top: 0.25rem; }
+  </style>
+</head>
+<body>
+  <h1>Private M-of-N Multisig</h1>
+  <p>Generate and verify vote proofs locally. Member NSKs never leave this page.</p>
+
+  <div class="section">
+    <h2>1 — Derive commitment</h2>
+    <label>NSK (64-char hex)</label>
+    <input id="nsk" type="password" placeholder="your nullifier secret key" />
+    <label>Multisig ID (64-char hex)</label>
+    <input id="multisig-id" placeholder="on-chain multisig account ID" />
+    <button onclick="deriveCommitment()">Derive</button>
+    <pre id="commit-out"></pre>
+    <p class="note">Share the commitment with the multisig creator. Keep the NSK secret.</p>
+  </div>
+
+  <div class="section">
+    <h2>2 — Vote</h2>
+    <p>Use the <code>multisig vote</code> CLI command to generate a receipt offline, then submit it via the chain interface.</p>
+    <pre>multisig vote \
+  --nsk &lt;NSK&gt; \
+  --member-index &lt;N&gt; \
+  --multisig-id &lt;ID&gt; \
+  --proposal-id &lt;ID&gt; \
+  --member-commitments &lt;c0,c1,...&gt; \
+  --out vote-receipt.bin</pre>
+  </div>
+
+  <script>
+    async function sha256hex(input) {
+      const enc = new TextEncoder();
+      const data = enc.encode(input);
+      const buf = await crypto.subtle.digest('SHA-256', data);
+      return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2,'0')).join('');
+    }
+
+    async function sha256bytes(bytes) {
+      const buf = await crypto.subtle.digest('SHA-256', bytes);
+      return new Uint8Array(buf);
+    }
+
+    function hexToBytes(hex) {
+      const bytes = new Uint8Array(hex.length / 2);
+      for (let i = 0; i < bytes.length; i++) bytes[i] = parseInt(hex.substr(i*2,2),16);
+      return bytes;
+    }
+
+    function bytesToHex(bytes) {
+      return Array.from(bytes).map(b => b.toString(16).padStart(2,'0')).join('');
+    }
+
+    async function deriveCommitment() {
+      const nsk = document.getElementById('nsk').value.trim();
+      const mid = document.getElementById('multisig-id').value.trim();
+      if (nsk.length !== 64 || mid.length !== 64) {
+        document.getElementById('commit-out').textContent = 'Error: NSK and Multisig ID must each be 64 hex characters.';
+        return;
+      }
+      // commitment = SHA256("member" || nsk_bytes || multisig_id_bytes)
+      const prefix = new TextEncoder().encode('member');
+      const nskBytes = hexToBytes(nsk);
+      const midBytes = hexToBytes(mid);
+      const combined = new Uint8Array(prefix.length + nskBytes.length + midBytes.length);
+      combined.set(prefix, 0);
+      combined.set(nskBytes, prefix.length);
+      combined.set(midBytes, prefix.length + nskBytes.length);
+      const hash = await sha256bytes(combined);
+      document.getElementById('commit-out').textContent = 'commitment: ' + bytesToHex(hash);
+    }
+  </script>
+</body>
+</html>
