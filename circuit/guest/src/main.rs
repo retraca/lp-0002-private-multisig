@@ -63,7 +63,7 @@ pub fn main() {
         preimage.extend_from_slice(b"member");
         preimage.extend_from_slice(&input.nsk);
         preimage.extend_from_slice(&input.multisig_id);
-        ShaImpl::hash_bytes(&preimage).as_bytes().try_into::<[u8; 32]>().unwrap()
+        ShaImpl::hash_bytes(&preimage).as_bytes().try_into().unwrap()
     };
 
     // 2. Verify the recomputed commitment matches the registered one at member_index.
@@ -80,7 +80,7 @@ pub fn main() {
         for c in &input.member_commitments {
             preimage.extend_from_slice(c);
         }
-        ShaImpl::hash_bytes(&preimage).as_bytes().try_into::<[u8; 32]>().unwrap()
+        ShaImpl::hash_bytes(&preimage).as_bytes().try_into().unwrap()
     };
 
     // 4. Compute per-proposal nullifier.
@@ -90,7 +90,7 @@ pub fn main() {
         preimage.extend_from_slice(&input.nsk);
         preimage.extend_from_slice(&input.proposal_id);
         preimage.extend_from_slice(&input.multisig_id);
-        ShaImpl::hash_bytes(&preimage).as_bytes().try_into::<[u8; 32]>().unwrap()
+        ShaImpl::hash_bytes(&preimage).as_bytes().try_into().unwrap()
     };
 
     // 5. Commit journal. member_set_root identifies which set was used
