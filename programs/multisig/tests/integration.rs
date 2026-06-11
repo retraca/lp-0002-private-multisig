@@ -1,31 +1,169 @@
 //! Integration tests for the LP-0002 private multisig on-chain program.
+//! Tests run against `apply_vote` and `apply_execute` directly -- no LEZ
+//! sequencer or RISC0 receipt needed.
 
+use borsh::BorshDeserialize;
 use private_multisig_program::*;
+use sha2::{Digest, Sha256};
 
-#[test]
-fn error_codes_are_distinct() {
-    let codes = [
-        ERR_PROOF_INVALID,
-        ERR_MULTISIG_MISMATCH,
-        ERR_PROPOSAL_NOT_FOUND,
-        ERR_NULLIFIER_SPENT,
-        ERR_MEMBER_NOT_REGISTERED,
-        ERR_PROPOSAL_ALREADY_EXECUTED,
-        ERR_THRESHOLD_NOT_MET,
-        ERR_ALREADY_INITIALIZED,
-        ERR_TOO_MANY_MEMBERS,
-        ERR_INVALID_THRESHOLD,
-    ];
-    let mut seen = std::collections::HashSet::new();
-    for &c in &codes {
-        assert!(seen.insert(c), "duplicate error code {}", c);
+fn sha256_chain(inputs: &[&[u8]]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    for i in inputs {
+        h.update(i);
+    }
+    h.finalize().into()
+}
+
+fn member_commitment(nsk: &[u8; 32], multisig_id: &[u8; 32]) -> [u8; 32] {
+    sha256_chain(&[b"member", nsk, multisig_id])
+}
+
+fn member_set_root(commitments: &[[u8; 32]]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    for c in commitments {
+        h.update(c);
+    }
+    h.finalize().into()
+}
+
+fn vote_nullifier(nsk: &[u8; 32], proposal_id: &[u8; 32], multisig_id: &[u8; 32]) -> [u8; 32] {
+    sha256_chain(&[b"multisig/v1/vote", nsk, proposal_id, multisig_id])
+}
+
+fn base_state(threshold: u8, nsks: &[[u8; 32]], multisig_id: &[u8; 32]) -> MultisigState {
+    let commitments = nsks.iter().map(|nsk| member_commitment(nsk, multisig_id)).collect();
+    MultisigState {
+        threshold,
+        member_commitments: commitments,
+        proposals: vec![],
+    }
+}
+
+fn add_proposal(state: &mut MultisigState, proposal_id: [u8; 32]) {
+    state.proposals.push(Proposal {
+        id: proposal_id,
+        action_bytes: b"transfer 100".to_vec(),
+        vote_count: 0,
+        executed: false,
+        spent_nullifiers: vec![],
+    });
+}
+
+const MULTISIG_ID: [u8; 32] = [0xccu8; 32];
+const PROPOSAL_ID: [u8; 32] = [0xaau8; 32];
+const NSK_1: [u8; 32] = [0x11u8; 32];
+const NSK_2: [u8; 32] = [0x22u8; 32];
+const NSK_3: [u8; 32] = [0x33u8; 32];
+
+fn make_journal(nsk: &[u8; 32]) -> VoteJournal {
+    let nsks = [NSK_1, NSK_2, NSK_3];
+    let commitments: Vec<[u8; 32]> = nsks.iter().map(|k| member_commitment(k, &MULTISIG_ID)).collect();
+    VoteJournal {
+        multisig_id: MULTISIG_ID,
+        proposal_id: PROPOSAL_ID,
+        nullifier: vote_nullifier(nsk, &PROPOSAL_ID, &MULTISIG_ID),
+        member_set_root: member_set_root(&commitments),
     }
 }
 
 #[test]
-fn multisig_state_borsh_roundtrip() {
-    use borsh::{BorshDeserialize, BorshSerialize};
+fn successful_vote_increments_count() {
+    let mut state = base_state(2, &[NSK_1, NSK_2, NSK_3], &MULTISIG_ID);
+    add_proposal(&mut state, PROPOSAL_ID);
 
+    let j = make_journal(&NSK_1);
+    apply_vote(&mut state, &j, MULTISIG_ID, PROPOSAL_ID).unwrap();
+
+    assert_eq!(state.proposals[0].vote_count, 1);
+    assert_eq!(state.proposals[0].spent_nullifiers.len(), 1);
+}
+
+#[test]
+fn threshold_reached_allows_execute() {
+    let mut state = base_state(2, &[NSK_1, NSK_2, NSK_3], &MULTISIG_ID);
+    add_proposal(&mut state, PROPOSAL_ID);
+
+    apply_vote(&mut state, &make_journal(&NSK_1), MULTISIG_ID, PROPOSAL_ID).unwrap();
+    apply_vote(&mut state, &make_journal(&NSK_2), MULTISIG_ID, PROPOSAL_ID).unwrap();
+
+    apply_execute(&mut state, PROPOSAL_ID).unwrap();
+    assert!(state.proposals[0].executed);
+}
+
+#[test]
+fn threshold_not_met_blocks_execute() {
+    let mut state = base_state(2, &[NSK_1, NSK_2, NSK_3], &MULTISIG_ID);
+    add_proposal(&mut state, PROPOSAL_ID);
+
+    apply_vote(&mut state, &make_journal(&NSK_1), MULTISIG_ID, PROPOSAL_ID).unwrap();
+
+    let err = apply_execute(&mut state, PROPOSAL_ID).unwrap_err();
+    assert_eq!(err, spel_framework::error::SpelError::Custom { code: ERR_THRESHOLD_NOT_MET });
+}
+
+#[test]
+fn nullifier_prevents_double_vote() {
+    let mut state = base_state(2, &[NSK_1, NSK_2, NSK_3], &MULTISIG_ID);
+    add_proposal(&mut state, PROPOSAL_ID);
+
+    apply_vote(&mut state, &make_journal(&NSK_1), MULTISIG_ID, PROPOSAL_ID).unwrap();
+
+    let err = apply_vote(&mut state, &make_journal(&NSK_1), MULTISIG_ID, PROPOSAL_ID).unwrap_err();
+    assert_eq!(err, spel_framework::error::SpelError::Custom { code: ERR_NULLIFIER_SPENT });
+    assert_eq!(state.proposals[0].vote_count, 1);
+}
+
+#[test]
+fn multisig_mismatch_rejected() {
+    let mut state = base_state(2, &[NSK_1, NSK_2, NSK_3], &MULTISIG_ID);
+    add_proposal(&mut state, PROPOSAL_ID);
+
+    let mut j = make_journal(&NSK_1);
+    j.multisig_id = [0xffu8; 32]; // wrong multisig
+
+    let err = apply_vote(&mut state, &j, MULTISIG_ID, PROPOSAL_ID).unwrap_err();
+    assert_eq!(err, spel_framework::error::SpelError::Custom { code: ERR_MULTISIG_MISMATCH });
+}
+
+#[test]
+fn unregistered_member_set_root_rejected() {
+    let mut state = base_state(2, &[NSK_1, NSK_2, NSK_3], &MULTISIG_ID);
+    add_proposal(&mut state, PROPOSAL_ID);
+
+    // Journal claims a different member set
+    let mut j = make_journal(&NSK_1);
+    j.member_set_root = [0x00u8; 32];
+
+    let err = apply_vote(&mut state, &j, MULTISIG_ID, PROPOSAL_ID).unwrap_err();
+    assert_eq!(err, spel_framework::error::SpelError::Custom { code: ERR_MEMBER_NOT_REGISTERED });
+}
+
+#[test]
+fn already_executed_proposal_rejects_further_execute() {
+    let mut state = base_state(1, &[NSK_1], &MULTISIG_ID);
+    add_proposal(&mut state, PROPOSAL_ID);
+
+    apply_vote(&mut state, &make_journal(&NSK_1), MULTISIG_ID, PROPOSAL_ID).unwrap();
+    apply_execute(&mut state, PROPOSAL_ID).unwrap();
+
+    let err = apply_execute(&mut state, PROPOSAL_ID).unwrap_err();
+    assert_eq!(err, spel_framework::error::SpelError::Custom { code: ERR_PROPOSAL_ALREADY_EXECUTED });
+}
+
+#[test]
+fn executed_proposal_rejects_further_votes() {
+    let mut state = base_state(1, &[NSK_1, NSK_2], &MULTISIG_ID);
+    add_proposal(&mut state, PROPOSAL_ID);
+
+    apply_vote(&mut state, &make_journal(&NSK_1), MULTISIG_ID, PROPOSAL_ID).unwrap();
+    apply_execute(&mut state, PROPOSAL_ID).unwrap();
+
+    let err = apply_vote(&mut state, &make_journal(&NSK_2), MULTISIG_ID, PROPOSAL_ID).unwrap_err();
+    assert_eq!(err, spel_framework::error::SpelError::Custom { code: ERR_PROPOSAL_ALREADY_EXECUTED });
+}
+
+#[test]
+fn multisig_state_borsh_roundtrip() {
     let state = MultisigState {
         threshold: 2,
         member_commitments: vec![[0x01u8; 32], [0x02u8; 32], [0x03u8; 32]],
@@ -43,90 +181,27 @@ fn multisig_state_borsh_roundtrip() {
 
     assert_eq!(decoded.threshold, 2);
     assert_eq!(decoded.member_commitments.len(), 3);
-    assert_eq!(decoded.proposals.len(), 1);
     assert_eq!(decoded.proposals[0].vote_count, 1);
     assert!(!decoded.proposals[0].executed);
 }
 
 #[test]
-fn member_commitment_is_key_and_multisig_bound() {
-    use sha2::{Digest, Sha256};
-
-    let nsk = [0x42u8; 32];
-    let multisig1 = [0x01u8; 32];
-    let multisig2 = [0x02u8; 32];
-
-    // commitment = SHA256("member" || nsk || multisig_id)
-    let commit = |multisig: &[u8; 32]| -> [u8; 32] {
-        let mut h = Sha256::new();
-        h.update(b"member");
-        h.update(&nsk);
-        h.update(multisig);
-        h.finalize().into()
-    };
-
-    let c1 = commit(&multisig1);
-    let c2 = commit(&multisig2);
-    assert_ne!(c1, c2, "commitments for different multisigs must differ");
-
-    // Different nsk for same multisig
-    let nsk2 = [0x99u8; 32];
-    let commit2 = |nsk: &[u8; 32]| -> [u8; 32] {
-        let mut h = Sha256::new();
-        h.update(b"member");
-        h.update(nsk);
-        h.update(&multisig1);
-        h.finalize().into()
-    };
-    assert_ne!(commit2(&nsk), commit2(&nsk2), "different nsks must yield different commitments");
-}
-
-#[test]
-fn nullifier_prevents_double_vote() {
-    use sha2::{Digest, Sha256};
-
-    let nsk = [0x42u8; 32];
-    let proposal_id = [0xbbu8; 32];
-    let multisig_id = [0xccu8; 32];
-
-    // nullifier = SHA256("multisig/v1/vote" || nsk || proposal_id || multisig_id)
-    let nullifier = |nsk: &[u8; 32]| -> [u8; 32] {
-        let mut h = Sha256::new();
-        h.update(b"multisig/v1/vote");
-        h.update(nsk);
-        h.update(&proposal_id);
-        h.update(&multisig_id);
-        h.finalize().into()
-    };
-
-    let n1 = nullifier(&nsk);
-    let n2 = nullifier(&nsk);
-    assert_eq!(n1, n2, "same inputs must produce same nullifier (deterministic)");
-
-    let nsk2 = [0x99u8; 32];
-    assert_ne!(n1, nullifier(&nsk2), "different member must produce different nullifier");
-}
-
-#[test]
-fn member_set_root_does_not_reveal_voter() {
-    use sha2::{Digest, Sha256};
-
-    // Three commitments representing three members
-    let c1 = [0x01u8; 32];
-    let c2 = [0x02u8; 32];
-    let c3 = [0x03u8; 32];
-    let commitments = [c1, c2, c3];
-
-    // root = SHA256(c1 || c2 || c3) -- same regardless of which member voted
-    let mut h = Sha256::new();
-    for c in &commitments {
-        h.update(c);
+fn error_codes_are_distinct() {
+    let codes = [
+        ERR_PROOF_INVALID,
+        ERR_MULTISIG_MISMATCH,
+        ERR_PROPOSAL_NOT_FOUND,
+        ERR_NULLIFIER_SPENT,
+        ERR_MEMBER_NOT_REGISTERED,
+        ERR_PROPOSAL_ALREADY_EXECUTED,
+        ERR_THRESHOLD_NOT_MET,
+        ERR_ALREADY_INITIALIZED,
+        ERR_TOO_MANY_MEMBERS,
+        ERR_INVALID_THRESHOLD,
+        ERR_TOO_MANY_PROPOSALS,
+    ];
+    let mut seen = std::collections::HashSet::new();
+    for &c in &codes {
+        assert!(seen.insert(c), "duplicate error code {}", c);
     }
-    let root: [u8; 32] = h.finalize().into();
-
-    // The root is the same whether member 0, 1, or 2 voted.
-    // An observer cannot determine which commitment was used.
-    assert_ne!(root, c1);
-    assert_ne!(root, c2);
-    assert_ne!(root, c3);
 }
