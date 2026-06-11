@@ -5,6 +5,7 @@
 use borsh::BorshDeserialize;
 use private_multisig_program::*;
 use sha2::{Digest, Sha256};
+use spel_framework::error::SpelError;
 
 fn sha256_chain(inputs: &[&[u8]]) -> [u8; 32] {
     let mut h = Sha256::new();
@@ -56,7 +57,10 @@ const NSK_2: [u8; 32] = [0x22u8; 32];
 const NSK_3: [u8; 32] = [0x33u8; 32];
 
 fn make_journal(nsk: &[u8; 32]) -> VoteJournal {
-    let nsks = [NSK_1, NSK_2, NSK_3];
+    make_journal_for_set(nsk, &[NSK_1, NSK_2, NSK_3])
+}
+
+fn make_journal_for_set(nsk: &[u8; 32], nsks: &[[u8; 32]]) -> VoteJournal {
     let commitments: Vec<[u8; 32]> = nsks.iter().map(|k| member_commitment(k, &MULTISIG_ID)).collect();
     VoteJournal {
         multisig_id: MULTISIG_ID,
@@ -98,7 +102,7 @@ fn threshold_not_met_blocks_execute() {
     apply_vote(&mut state, &make_journal(&NSK_1), MULTISIG_ID, PROPOSAL_ID).unwrap();
 
     let err = apply_execute(&mut state, PROPOSAL_ID).unwrap_err();
-    assert_eq!(err, spel_framework::error::SpelError::Custom { code: ERR_THRESHOLD_NOT_MET });
+    let SpelError::Custom { code, .. } = err else { panic!("wrong error type") }; assert_eq!(code, ERR_THRESHOLD_NOT_MET, "wrong error code");
 }
 
 #[test]
@@ -109,7 +113,7 @@ fn nullifier_prevents_double_vote() {
     apply_vote(&mut state, &make_journal(&NSK_1), MULTISIG_ID, PROPOSAL_ID).unwrap();
 
     let err = apply_vote(&mut state, &make_journal(&NSK_1), MULTISIG_ID, PROPOSAL_ID).unwrap_err();
-    assert_eq!(err, spel_framework::error::SpelError::Custom { code: ERR_NULLIFIER_SPENT });
+    let SpelError::Custom { code, .. } = err else { panic!("wrong error type") }; assert_eq!(code, ERR_NULLIFIER_SPENT, "wrong error code");
     assert_eq!(state.proposals[0].vote_count, 1);
 }
 
@@ -122,7 +126,7 @@ fn multisig_mismatch_rejected() {
     j.multisig_id = [0xffu8; 32]; // wrong multisig
 
     let err = apply_vote(&mut state, &j, MULTISIG_ID, PROPOSAL_ID).unwrap_err();
-    assert_eq!(err, spel_framework::error::SpelError::Custom { code: ERR_MULTISIG_MISMATCH });
+    let SpelError::Custom { code, .. } = err else { panic!("wrong error type") }; assert_eq!(code, ERR_MULTISIG_MISMATCH, "wrong error code");
 }
 
 #[test]
@@ -135,7 +139,7 @@ fn unregistered_member_set_root_rejected() {
     j.member_set_root = [0x00u8; 32];
 
     let err = apply_vote(&mut state, &j, MULTISIG_ID, PROPOSAL_ID).unwrap_err();
-    assert_eq!(err, spel_framework::error::SpelError::Custom { code: ERR_MEMBER_NOT_REGISTERED });
+    let SpelError::Custom { code, .. } = err else { panic!("wrong error type") }; assert_eq!(code, ERR_MEMBER_NOT_REGISTERED, "wrong error code");
 }
 
 #[test]
@@ -143,11 +147,11 @@ fn already_executed_proposal_rejects_further_execute() {
     let mut state = base_state(1, &[NSK_1], &MULTISIG_ID);
     add_proposal(&mut state, PROPOSAL_ID);
 
-    apply_vote(&mut state, &make_journal(&NSK_1), MULTISIG_ID, PROPOSAL_ID).unwrap();
+    apply_vote(&mut state, &make_journal_for_set(&NSK_1, &[NSK_1]), MULTISIG_ID, PROPOSAL_ID).unwrap();
     apply_execute(&mut state, PROPOSAL_ID).unwrap();
 
     let err = apply_execute(&mut state, PROPOSAL_ID).unwrap_err();
-    assert_eq!(err, spel_framework::error::SpelError::Custom { code: ERR_PROPOSAL_ALREADY_EXECUTED });
+    let SpelError::Custom { code, .. } = err else { panic!("wrong error type") }; assert_eq!(code, ERR_PROPOSAL_ALREADY_EXECUTED, "wrong error code");
 }
 
 #[test]
@@ -155,11 +159,11 @@ fn executed_proposal_rejects_further_votes() {
     let mut state = base_state(1, &[NSK_1, NSK_2], &MULTISIG_ID);
     add_proposal(&mut state, PROPOSAL_ID);
 
-    apply_vote(&mut state, &make_journal(&NSK_1), MULTISIG_ID, PROPOSAL_ID).unwrap();
+    apply_vote(&mut state, &make_journal_for_set(&NSK_1, &[NSK_1, NSK_2]), MULTISIG_ID, PROPOSAL_ID).unwrap();
     apply_execute(&mut state, PROPOSAL_ID).unwrap();
 
-    let err = apply_vote(&mut state, &make_journal(&NSK_2), MULTISIG_ID, PROPOSAL_ID).unwrap_err();
-    assert_eq!(err, spel_framework::error::SpelError::Custom { code: ERR_PROPOSAL_ALREADY_EXECUTED });
+    let err = apply_vote(&mut state, &make_journal_for_set(&NSK_2, &[NSK_1, NSK_2]), MULTISIG_ID, PROPOSAL_ID).unwrap_err();
+    let SpelError::Custom { code, .. } = err else { panic!("wrong error type") }; assert_eq!(code, ERR_PROPOSAL_ALREADY_EXECUTED, "wrong error code");
 }
 
 #[test]

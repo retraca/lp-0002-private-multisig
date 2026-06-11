@@ -18,7 +18,8 @@
 //! to participate in governance.
 
 use borsh::{BorshDeserialize, BorshSerialize};
-use nssa_core::account::{AccountPostState, AccountWithMetadata, Data};
+use nssa_core::account::{AccountWithMetadata, Data};
+use nssa_core::program::AccountPostState;
 use sha2::{Digest, Sha256};
 use spel_framework::error::SpelError;
 
@@ -89,14 +90,14 @@ pub fn initialize(
     threshold: u8,
     member_commitments: Vec<[u8; 32]>,
 ) -> Result<Vec<AccountPostState>, SpelError> {
-    if !multisig_account.account.data.0.is_empty() {
-        return Err(SpelError::Custom { code: ERR_ALREADY_INITIALIZED });
+    if !multisig_account.account.data.as_ref().is_empty() {
+        return Err(SpelError::Custom { code: ERR_ALREADY_INITIALIZED, message: "multisig already initialized".to_string() });
     }
     if member_commitments.is_empty() || member_commitments.len() > MAX_MEMBERS {
-        return Err(SpelError::Custom { code: ERR_TOO_MANY_MEMBERS });
+        return Err(SpelError::Custom { code: ERR_TOO_MANY_MEMBERS, message: "invalid member count".to_string() });
     }
     if threshold == 0 || threshold as usize > member_commitments.len() {
-        return Err(SpelError::Custom { code: ERR_INVALID_THRESHOLD });
+        return Err(SpelError::Custom { code: ERR_INVALID_THRESHOLD, message: "invalid threshold".to_string() });
     }
 
     let state = MultisigState {
@@ -105,7 +106,8 @@ pub fn initialize(
         proposals: Vec::new(),
     };
     let mut account = multisig_account.account;
-    account.data = Data::from_borsh(&state);
+    account.data = Data::try_from(borsh::to_vec(&state).expect("state serialise failed"))
+        .expect("state too large");
     Ok(vec![AccountPostState::new(account)])
 }
 
@@ -117,11 +119,11 @@ pub fn submit_proposal(
     proposal_id: [u8; 32],
     action_bytes: Vec<u8>,
 ) -> Result<Vec<AccountPostState>, SpelError> {
-    let mut state = MultisigState::try_from_slice(&multisig_account.account.data.0)
-        .map_err(|_| SpelError::Custom { code: ERR_PROOF_INVALID })?;
+    let mut state = MultisigState::try_from_slice(multisig_account.account.data.as_ref())
+        .map_err(|_| SpelError::Custom { code: ERR_PROOF_INVALID, message: "state deserialise failed".to_string() })?;
 
     if state.proposals.len() >= MAX_PROPOSALS {
-        return Err(SpelError::Custom { code: ERR_TOO_MANY_PROPOSALS });
+        return Err(SpelError::Custom { code: ERR_TOO_MANY_PROPOSALS, message: "proposal capacity reached".to_string() });
     }
     state.proposals.push(Proposal {
         id: proposal_id,
@@ -132,7 +134,8 @@ pub fn submit_proposal(
     });
 
     let mut account = multisig_account.account;
-    account.data = Data::from_borsh(&state);
+    account.data = Data::try_from(borsh::to_vec(&state).expect("state serialise failed"))
+        .expect("state too large");
     Ok(vec![AccountPostState::new(account)])
 }
 
@@ -154,27 +157,27 @@ pub fn apply_vote(
     proposal_id: [u8; 32],
 ) -> Result<(), SpelError> {
     if journal.multisig_id != multisig_id {
-        return Err(SpelError::Custom { code: ERR_MULTISIG_MISMATCH });
+        return Err(SpelError::Custom { code: ERR_MULTISIG_MISMATCH, message: "multisig id mismatch".to_string() });
     }
     if journal.proposal_id != proposal_id {
-        return Err(SpelError::Custom { code: ERR_PROPOSAL_NOT_FOUND });
+        return Err(SpelError::Custom { code: ERR_PROPOSAL_NOT_FOUND, message: "proposal id mismatch".to_string() });
     }
 
     let expected_root = compute_member_set_root(&state.member_commitments);
     if journal.member_set_root != expected_root {
-        return Err(SpelError::Custom { code: ERR_MEMBER_NOT_REGISTERED });
+        return Err(SpelError::Custom { code: ERR_MEMBER_NOT_REGISTERED, message: "member set root mismatch".to_string() });
     }
 
     let proposal = state.proposals.iter_mut()
         .find(|p| p.id == proposal_id)
-        .ok_or(SpelError::Custom { code: ERR_PROPOSAL_NOT_FOUND })?;
+        .ok_or(SpelError::Custom { code: ERR_PROPOSAL_NOT_FOUND, message: "proposal not found".to_string() })?;
 
     if proposal.executed {
-        return Err(SpelError::Custom { code: ERR_PROPOSAL_ALREADY_EXECUTED });
+        return Err(SpelError::Custom { code: ERR_PROPOSAL_ALREADY_EXECUTED, message: "proposal already executed".to_string() });
     }
 
     if proposal.spent_nullifiers.contains(&journal.nullifier) {
-        return Err(SpelError::Custom { code: ERR_NULLIFIER_SPENT });
+        return Err(SpelError::Custom { code: ERR_NULLIFIER_SPENT, message: "nullifier already spent".to_string() });
     }
 
     proposal.spent_nullifiers.push(journal.nullifier);
@@ -190,13 +193,13 @@ pub fn apply_execute(
 ) -> Result<(), SpelError> {
     let proposal = state.proposals.iter_mut()
         .find(|p| p.id == proposal_id)
-        .ok_or(SpelError::Custom { code: ERR_PROPOSAL_NOT_FOUND })?;
+        .ok_or(SpelError::Custom { code: ERR_PROPOSAL_NOT_FOUND, message: "proposal not found".to_string() })?;
 
     if proposal.executed {
-        return Err(SpelError::Custom { code: ERR_PROPOSAL_ALREADY_EXECUTED });
+        return Err(SpelError::Custom { code: ERR_PROPOSAL_ALREADY_EXECUTED, message: "proposal already executed".to_string() });
     }
     if proposal.vote_count < state.threshold {
-        return Err(SpelError::Custom { code: ERR_THRESHOLD_NOT_MET });
+        return Err(SpelError::Custom { code: ERR_THRESHOLD_NOT_MET, message: "threshold not met".to_string() });
     }
 
     proposal.executed = true;
@@ -212,14 +215,14 @@ pub fn vote(
     proposal_id: [u8; 32],
     receipt_bytes: Vec<u8>,
 ) -> Result<Vec<AccountPostState>, SpelError> {
-    let mut state = MultisigState::try_from_slice(&multisig_account.account.data.0)
-        .map_err(|_| SpelError::Custom { code: ERR_PROOF_INVALID })?;
+    let mut state = MultisigState::try_from_slice(multisig_account.account.data.as_ref())
+        .map_err(|_| SpelError::Custom { code: ERR_PROOF_INVALID, message: "state deserialise failed".to_string() })?;
 
     let receipt: risc0_zkvm::Receipt = risc0_zkvm::serde::from_slice(&receipt_bytes)
-        .map_err(|_| SpelError::Custom { code: ERR_PROOF_INVALID })?;
+        .map_err(|_| SpelError::Custom { code: ERR_PROOF_INVALID, message: "receipt deserialise failed".to_string() })?;
 
     receipt.verify(IMAGE_ID)
-        .map_err(|_| SpelError::Custom { code: ERR_PROOF_INVALID })?;
+        .map_err(|_| SpelError::Custom { code: ERR_PROOF_INVALID, message: "receipt verification failed".to_string() })?;
 
     #[derive(serde::Deserialize)]
     struct RawJournal {
@@ -230,7 +233,7 @@ pub fn vote(
     }
 
     let j: RawJournal = receipt.journal.decode()
-        .map_err(|_| SpelError::Custom { code: ERR_PROOF_INVALID })?;
+        .map_err(|_| SpelError::Custom { code: ERR_PROOF_INVALID, message: "journal decode failed".to_string() })?;
 
     let journal = VoteJournal {
         multisig_id: j.multisig_id,
@@ -239,11 +242,12 @@ pub fn vote(
         member_set_root: j.member_set_root,
     };
 
-    let multisig_id: [u8; 32] = multisig_account.account_id.to_bytes();
+    let multisig_id: [u8; 32] = *multisig_account.account_id.value();
     apply_vote(&mut state, &journal, multisig_id, proposal_id)?;
 
     let mut account = multisig_account.account;
-    account.data = Data::from_borsh(&state);
+    account.data = Data::try_from(borsh::to_vec(&state).expect("state serialise failed"))
+        .expect("state too large");
     Ok(vec![AccountPostState::new(account)])
 }
 
@@ -256,12 +260,13 @@ pub fn execute(
     multisig_account: AccountWithMetadata,
     proposal_id: [u8; 32],
 ) -> Result<Vec<AccountPostState>, SpelError> {
-    let mut state = MultisigState::try_from_slice(&multisig_account.account.data.0)
-        .map_err(|_| SpelError::Custom { code: ERR_PROOF_INVALID })?;
+    let mut state = MultisigState::try_from_slice(multisig_account.account.data.as_ref())
+        .map_err(|_| SpelError::Custom { code: ERR_PROOF_INVALID, message: "state deserialise failed".to_string() })?;
 
     apply_execute(&mut state, proposal_id)?;
 
     let mut account = multisig_account.account;
-    account.data = Data::from_borsh(&state);
+    account.data = Data::try_from(borsh::to_vec(&state).expect("state serialise failed"))
+        .expect("state too large");
     Ok(vec![AccountPostState::new(account)])
 }
