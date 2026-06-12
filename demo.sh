@@ -56,8 +56,23 @@ echo "[1/7] Building..."
 # shellcheck disable=SC2086
 cargo build --release --bin multisig $BIN_FEATURES 2>&1 | tail -3
 
-# Demo multisig account ID (deterministic -- same every run)
-MULTISIG_ID="cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+# Multisig account: in chain mode the account is claimed by the program at
+# initialize, which requires the tx to be signed with the account's key.
+# Generate a fresh key and derive the multisig ID from it.
+if [ "$CHAIN_MODE" = "1" ]; then
+  KEYGEN_OUT=$("$BIN" chain keygen 2>/dev/null || true)
+  if [ -z "$KEYGEN_OUT" ]; then
+    # binary not built with chain yet; build then retry after [1/7]
+    cargo build --release --bin multisig --features chain 2>&1 | tail -1
+    KEYGEN_OUT=$("$BIN" chain keygen)
+  fi
+  SIGNING_KEY=$(echo "$KEYGEN_OUT" | grep '^signing_key:' | awk '{print $2}')
+  MULTISIG_ID=$(echo "$KEYGEN_OUT" | grep '^multisig_id:' | awk '{print $2}')
+  echo "Multisig account: $MULTISIG_ID (fresh key, demo only)"
+else
+  # Offline mode: deterministic ID (no on-chain claiming happens)
+  MULTISIG_ID="cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+fi
 
 # Three members with deterministic test nsks (never use outside demo)
 NSK_1="1111111111111111111111111111111111111111111111111111111111111111"
@@ -91,13 +106,20 @@ if [ "$CHAIN_MODE" = "1" ]; then
   TX=$("$BIN" chain initialize \
     --sequencer "$SEQUENCER" \
     --program-id "$PROGRAM_ID" \
-    --multisig-id "$MULTISIG_ID" \
+    --signing-key "$SIGNING_KEY" \
     --threshold 2 \
     --commitments "$MEMBER_COMMITMENTS")
   echo "  Initialize tx: $TX"
+  echo "  Waiting for inclusion..."
+  for i in $(seq 1 24); do
+    STATE=$("$BIN" chain state --sequencer "$SEQUENCER" --multisig-id "$MULTISIG_ID" 2>/dev/null || true)
+    echo "$STATE" | grep -q "program_owner: $PROGRAM_ID" && break
+    sleep 5
+  done
+  "$BIN" chain state --sequencer "$SEQUENCER" --multisig-id "$MULTISIG_ID"
 
   echo ""
-  echo "  Submitting proposal..."
+  echo "  Submitting proposal (unsigned: the account is now program-owned)..."
   TX=$("$BIN" chain submit-proposal \
     --sequencer "$SEQUENCER" \
     --program-id "$PROGRAM_ID" \
@@ -105,6 +127,12 @@ if [ "$CHAIN_MODE" = "1" ]; then
     --proposal-id "$PROPOSAL_ID" \
     --action "7472616e73666572203130300a")
   echo "  Proposal tx: $TX"
+  echo "  Waiting for inclusion..."
+  for i in $(seq 1 24); do
+    "$BIN" chain state --sequencer "$SEQUENCER" --multisig-id "$MULTISIG_ID" 2>/dev/null \
+      | grep -q "${PROPOSAL_ID:0:8}" && break
+    sleep 5
+  done
 else
   echo "[3/7] On-chain init skipped (pass --chain to run on-chain steps)"
   echo "      threshold=2, commitments=[$COMMIT_1, $COMMIT_2, ...]"
@@ -137,29 +165,16 @@ echo "[6/7] Verifying both receipts offline..."
 
 echo ""
 if [ "$CHAIN_MODE" = "1" ]; then
-  echo "[7/7] Submitting votes on-chain and executing..."
-  TX=$("$BIN" chain submit-vote \
-    --sequencer "$SEQUENCER" \
-    --program-id "$PROGRAM_ID" \
-    --multisig-id "$MULTISIG_ID" \
-    --proposal-id "$PROPOSAL_ID" \
-    --receipt /tmp/vote0.bin)
-  echo "  Vote 0 tx: $TX"
-
-  TX=$("$BIN" chain submit-vote \
-    --sequencer "$SEQUENCER" \
-    --program-id "$PROGRAM_ID" \
-    --multisig-id "$MULTISIG_ID" \
-    --proposal-id "$PROPOSAL_ID" \
-    --receipt /tmp/vote1.bin)
-  echo "  Vote 1 tx: $TX"
-
-  TX=$("$BIN" chain execute \
-    --sequencer "$SEQUENCER" \
-    --program-id "$PROGRAM_ID" \
-    --multisig-id "$MULTISIG_ID" \
-    --proposal-id "$PROPOSAL_ID")
-  echo "  Execute tx: $TX"
+  echo "[7/7] On-chain vote submission"
+  echo ""
+  echo "  KNOWN LIMITATION: LEZ public transactions carry no RISC0 receipts, so"
+  echo "  the program's env::verify cannot resolve the vote-proof assumption"
+  echo "  (sys_verify_integrity: no receipt found). Submitting votes requires"
+  echo "  the LEZ privacy-preserving transaction path, where the client proves"
+  echo "  the program execution locally with the vote receipt as an assumption."
+  echo "  See docs/TESTNET_EVIDENCE.md. Vote receipts were generated and"
+  echo "  verified offline above; on-chain submission via the privacy path is"
+  echo "  in progress."
 else
   echo "[7/7] On-chain submit skipped (pass --chain to run on-chain steps)"
 fi
