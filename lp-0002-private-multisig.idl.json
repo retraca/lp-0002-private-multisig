@@ -5,41 +5,116 @@
     {
       "name": "initialize",
       "accounts": [
-        { "name": "multisig", "isMut": true, "isSigner": false },
-        { "name": "authority", "isMut": false, "isSigner": true }
+        {
+          "name": "multisig",
+          "isMut": true,
+          "isSigner": false
+        },
+        {
+          "name": "authority",
+          "isMut": false,
+          "isSigner": true
+        }
       ],
       "args": [
-        { "name": "threshold", "type": "u8" },
-        { "name": "member_commitments", "type": { "vec": { "array": ["u8", 32] } } }
+        {
+          "name": "threshold",
+          "type": "u8"
+        },
+        {
+          "name": "vote_circuit_program_id",
+          "type": {
+            "array": [
+              "u32",
+              8
+            ]
+          }
+        },
+        {
+          "name": "member_commitments",
+          "type": {
+            "vec": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
+          }
+        }
       ]
     },
     {
       "name": "submit_proposal",
       "accounts": [
-        { "name": "multisig", "isMut": true, "isSigner": false }
+        {
+          "name": "multisig",
+          "isMut": true,
+          "isSigner": false
+        }
       ],
       "args": [
-        { "name": "proposal_id", "type": { "array": ["u8", 32] } },
-        { "name": "action_bytes", "type": "bytes" }
+        {
+          "name": "proposal_id",
+          "type": {
+            "array": [
+              "u8",
+              32
+            ]
+          }
+        },
+        {
+          "name": "action_bytes",
+          "type": "bytes"
+        }
       ]
     },
     {
       "name": "vote",
       "accounts": [
-        { "name": "multisig", "isMut": true, "isSigner": false }
+        {
+          "name": "multisig",
+          "isMut": true,
+          "isSigner": false
+        }
       ],
       "args": [
-        { "name": "proposal_id", "type": { "array": ["u8", 32] } },
-        { "name": "receipt_bytes", "type": "bytes" }
+        {
+          "name": "proposal_id",
+          "type": {
+            "array": [
+              "u8",
+              32
+            ]
+          }
+        },
+        {
+          "name": "journal_bytes",
+          "type": "bytes"
+        }
+      ],
+      "docs": [
+        "Callable only as a chained call from the registered vote-circuit program (PPE pipeline)."
       ]
     },
     {
       "name": "execute",
       "accounts": [
-        { "name": "multisig", "isMut": true, "isSigner": false }
+        {
+          "name": "multisig",
+          "isMut": true,
+          "isSigner": false
+        }
       ],
       "args": [
-        { "name": "proposal_id", "type": { "array": ["u8", 32] } }
+        {
+          "name": "proposal_id",
+          "type": {
+            "array": [
+              "u8",
+              32
+            ]
+          }
+        }
       ]
     }
   ],
@@ -49,9 +124,38 @@
       "type": {
         "kind": "struct",
         "fields": [
-          { "name": "threshold", "type": "u8" },
-          { "name": "member_commitments", "type": { "vec": { "array": ["u8", 32] } } },
-          { "name": "proposals", "type": { "vec": { "defined": "Proposal" } } }
+          {
+            "name": "threshold",
+            "type": "u8"
+          },
+          {
+            "name": "vote_circuit_program_id",
+            "type": {
+              "array": [
+                "u32",
+                8
+              ]
+            }
+          },
+          {
+            "name": "member_commitments",
+            "type": {
+              "vec": {
+                "array": [
+                  "u8",
+                  32
+                ]
+              }
+            }
+          },
+          {
+            "name": "proposals",
+            "type": {
+              "vec": {
+                "defined": "Proposal"
+              }
+            }
+          }
         ]
       }
     },
@@ -60,25 +164,82 @@
       "type": {
         "kind": "struct",
         "fields": [
-          { "name": "id", "type": { "array": ["u8", 32] } },
-          { "name": "action_bytes", "type": "bytes" },
-          { "name": "vote_count", "type": "u8" },
-          { "name": "executed", "type": "bool" },
-          { "name": "spent_nullifiers", "type": { "vec": { "array": ["u8", 32] } } }
+          {
+            "name": "id",
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
+          },
+          {
+            "name": "action_bytes",
+            "type": "bytes"
+          },
+          {
+            "name": "vote_count",
+            "type": "u8"
+          },
+          {
+            "name": "executed",
+            "type": "bool"
+          },
+          {
+            "name": "spent_nullifiers",
+            "type": {
+              "vec": {
+                "array": [
+                  "u8",
+                  32
+                ]
+              }
+            }
+          }
         ]
       }
     }
   ],
   "errors": [
-    { "code": 6001, "name": "ProofInvalid" },
-    { "code": 6002, "name": "MultisigMismatch" },
-    { "code": 6003, "name": "ProposalNotFound" },
-    { "code": 6004, "name": "NullifierSpent" },
-    { "code": 6005, "name": "MemberNotRegistered" },
-    { "code": 6006, "name": "ProposalAlreadyExecuted" },
-    { "code": 6007, "name": "ThresholdNotMet" },
-    { "code": 6008, "name": "AlreadyInitialized" },
-    { "code": 6009, "name": "TooManyMembers" },
-    { "code": 6010, "name": "InvalidThreshold" }
+    {
+      "code": 6001,
+      "name": "ProofInvalid"
+    },
+    {
+      "code": 6002,
+      "name": "MultisigMismatch"
+    },
+    {
+      "code": 6003,
+      "name": "ProposalNotFound"
+    },
+    {
+      "code": 6004,
+      "name": "NullifierSpent"
+    },
+    {
+      "code": 6005,
+      "name": "MemberNotRegistered"
+    },
+    {
+      "code": 6006,
+      "name": "ProposalAlreadyExecuted"
+    },
+    {
+      "code": 6007,
+      "name": "ThresholdNotMet"
+    },
+    {
+      "code": 6008,
+      "name": "AlreadyInitialized"
+    },
+    {
+      "code": 6009,
+      "name": "TooManyMembers"
+    },
+    {
+      "code": 6010,
+      "name": "InvalidThreshold"
+    }
   ]
 }
