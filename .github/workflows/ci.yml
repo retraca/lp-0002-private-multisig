@@ -50,3 +50,8 @@ jobs:
         env:
           RISC0_DEV_MODE: "1"
         run: cargo test --workspace -- --test-threads=1
+
+      - name: Multisig program state-machine tests
+        env:
+          RISC0_DEV_MODE: "1"
+        run: cargo test --manifest-path programs/multisig/Cargo.toml --lib --tests -- --test-threads=1

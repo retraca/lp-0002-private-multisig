@@ -35,6 +35,7 @@ fn base_state(threshold: u8, nsks: &[[u8; 32]], multisig_id: &[u8; 32]) -> Multi
     let commitments = nsks.iter().map(|nsk| member_commitment(nsk, multisig_id)).collect();
     MultisigState {
         threshold,
+        vote_circuit_program_id: VOTE_CIRCUIT_PROGRAM_ID,
         member_commitments: commitments,
         proposals: vec![],
     }
@@ -55,6 +56,7 @@ const PROPOSAL_ID: [u8; 32] = [0xaau8; 32];
 const NSK_1: [u8; 32] = [0x11u8; 32];
 const NSK_2: [u8; 32] = [0x22u8; 32];
 const NSK_3: [u8; 32] = [0x33u8; 32];
+const VOTE_CIRCUIT_PROGRAM_ID: [u32; 8] = [0x11u32; 8];
 
 fn make_journal(nsk: &[u8; 32]) -> VoteJournal {
     make_journal_for_set(nsk, &[NSK_1, NSK_2, NSK_3])
@@ -170,6 +172,7 @@ fn executed_proposal_rejects_further_votes() {
 fn multisig_state_borsh_roundtrip() {
     let state = MultisigState {
         threshold: 2,
+        vote_circuit_program_id: VOTE_CIRCUIT_PROGRAM_ID,
         member_commitments: vec![[0x01u8; 32], [0x02u8; 32], [0x03u8; 32]],
         proposals: vec![Proposal {
             id: [0xaau8; 32],

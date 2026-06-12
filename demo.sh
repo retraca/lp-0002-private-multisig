@@ -2,7 +2,9 @@
 # LP-0002 private M-of-N multisig end-to-end demo (2-of-3).
 #
 # Offline mode (default): derives commitments, generates two vote proofs, verifies both.
-# Chain mode (--chain):   also deploys and calls the on-chain SPEL program.
+# Chain mode (--chain):   full on-chain lifecycle -- initialize, proposal, two votes
+#                         delivered as privacy-preserving transactions (chained-call
+#                         composition through the vote-circuit program), execute.
 #
 # Usage:
 #   ./demo.sh [--dev] [--chain] [--sequencer <url>]
@@ -99,13 +101,14 @@ if [ "$CHAIN_MODE" = "1" ]; then
     PROGRAM_ID=$(wallet deploy-program "$PROGRAM_BIN" | grep -oE '[0-9a-f]{64}' | head -1)
     echo "  Program ID: $PROGRAM_ID"
   elif [ -z "$PROGRAM_ID" ]; then
-    echo "  Skipping deploy (set PROGRAM_BIN=<path> or PROGRAM_ID=<hex> to run this step)"
-    echo "  Testnet program ID: 9abec04f2a082b6bf70f5a38f2dc967cc7605b3159a6713d93e62f76b0a55725"
-    PROGRAM_ID="${PROGRAM_ID:-9abec04f2a082b6bf70f5a38f2dc967cc7605b3159a6713d93e62f76b0a55725}"
+    echo "  Using testnet program IDs (deployed, see docs/TESTNET_EVIDENCE.md)"
+    PROGRAM_ID="${PROGRAM_ID:-fb2d6afe695b3d03736f6a7f869d980884afc61f24d5199194f0891555a8a8e3}"
   fi
+  VOTE_CIRCUIT_PROGRAM_ID="${VOTE_CIRCUIT_PROGRAM_ID:-7af8104a46999ed81962d5eb0dc4482db84a1352bacc95e86210fe1a46f87063}"
   TX=$("$BIN" chain initialize \
     --sequencer "$SEQUENCER" \
     --program-id "$PROGRAM_ID" \
+    --vote-circuit-program-id "$VOTE_CIRCUIT_PROGRAM_ID" \
     --signing-key "$SIGNING_KEY" \
     --threshold 2 \
     --commitments "$MEMBER_COMMITMENTS")
@@ -165,16 +168,47 @@ echo "[6/7] Verifying both receipts offline..."
 
 echo ""
 if [ "$CHAIN_MODE" = "1" ]; then
-  echo "[7/7] On-chain vote submission"
+  echo "[7/7] Casting votes on-chain (privacy-preserving transactions) and executing..."
   echo ""
-  echo "  KNOWN LIMITATION: LEZ public transactions carry no RISC0 receipts, so"
-  echo "  the program's env::verify cannot resolve the vote-proof assumption"
-  echo "  (sys_verify_integrity: no receipt found). Submitting votes requires"
-  echo "  the LEZ privacy-preserving transaction path, where the client proves"
-  echo "  the program execution locally with the vote receipt as an assumption."
-  echo "  See docs/TESTNET_EVIDENCE.md. Vote receipts were generated and"
-  echo "  verified offline above; on-chain submission via the privacy path is"
-  echo "  in progress."
+  echo "  Each vote runs the vote-circuit program locally with the nsk as a"
+  echo "  PRIVATE input, chains the call into the multisig program, and submits"
+  echo "  one composite proof. The nsk never leaves this machine."
+  echo ""
+  TX=$("$BIN" chain vote \
+    --sequencer "$SEQUENCER" \
+    --program-id "$PROGRAM_ID" \
+    --multisig-id "$MULTISIG_ID" \
+    --proposal-id "$PROPOSAL_ID" \
+    --nsk "$NSK_1" \
+    --member-index 0 | grep '^tx:' | awk '{print $2}')
+  echo "  Vote 0 tx: $TX"
+
+  TX=$("$BIN" chain vote \
+    --sequencer "$SEQUENCER" \
+    --program-id "$PROGRAM_ID" \
+    --multisig-id "$MULTISIG_ID" \
+    --proposal-id "$PROPOSAL_ID" \
+    --nsk "$NSK_2" \
+    --member-index 1 | grep '^tx:' | awk '{print $2}')
+  echo "  Vote 1 tx: $TX"
+
+  echo "  Waiting for votes to land..."
+  for i in $(seq 1 36); do
+    DATA=$("$BIN" chain state --sequencer "$SEQUENCER" --multisig-id "$MULTISIG_ID" 2>/dev/null | grep '^data' || true)
+    echo "$DATA" | grep -qE "\(255 bytes\)" && break
+    sleep 5
+  done
+
+  TX=$("$BIN" chain execute \
+    --sequencer "$SEQUENCER" \
+    --program-id "$PROGRAM_ID" \
+    --multisig-id "$MULTISIG_ID" \
+    --proposal-id "$PROPOSAL_ID")
+  echo "  Execute tx: $TX"
+  sleep 12
+  echo ""
+  echo "  Final multisig state (vote_count=2, executed=true, 2 spent nullifiers):"
+  "$BIN" chain state --sequencer "$SEQUENCER" --multisig-id "$MULTISIG_ID"
 else
   echo "[7/7] On-chain submit skipped (pass --chain to run on-chain steps)"
 fi

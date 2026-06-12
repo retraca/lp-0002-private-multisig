@@ -4,42 +4,39 @@
 //! which members voted. The on-chain state reveals only the threshold and
 //! whether it was reached.
 //!
-//! Architecture:
+//! Architecture (chained-call composition over the LEZ privacy-preserving
+//! execution pipeline):
 //!   - Members register at initialization: each submits a commitment
 //!     SHA256("member" || nsk || multisig_id) where nsk is a fresh client-side key.
-//!   - To vote, a member runs the RISC0 guest off-chain and submits the receipt.
-//!     The receipt proves nsk knowledge without revealing which member voted.
+//!   - To vote, a member submits a privacy-preserving transaction whose initial
+//!     call is the vote-circuit program (`programs/vote_circuit`). That program
+//!     receives the nsk as a PRIVATE input (initial-call instruction data never
+//!     appears on-chain), recomputes the member commitment against the multisig
+//!     account state, derives the per-proposal nullifier and the member set
+//!     root, and declares a ChainedCall into this program's `vote` instruction.
+//!   - `vote` trusts its caller identity: the PPE outer circuit proves the
+//!     chained-call linkage (caller_program_id cannot be spoofed), so checking
+//!     `ctx.caller_program_id == state.vote_circuit_program_id` is equivalent
+//!     to verifying the membership proof itself.
 //!   - The program tracks per-proposal nullifiers. When the vote count reaches
 //!     the threshold, the proposal can be executed.
 //!
-//! LEZ nonce constraint: because members prove key knowledge via ZK (not by
-//! signing a transaction with their shielded account), the nonce increment
-//! constraint does not apply. Members never spend from their shielded accounts
-//! to participate in governance.
+//! LEZ nonce constraint: members never spend from their shielded accounts to
+//! participate in governance; the voting key material (nsk) is separate.
 
 use borsh::{BorshDeserialize, BorshSerialize};
-use nssa_core::account::{AccountWithMetadata, Data};
-use nssa_core::program::AccountPostState;
 use sha2::{Digest, Sha256};
 use spel_framework::error::SpelError;
 
-/// Compute the member set root used by the guest circuit:
+/// Compute the member set root used by the vote circuit:
 /// SHA256(commitment[0] || ... || commitment[N-1]).
-fn compute_member_set_root(commitments: &[[u8; 32]]) -> [u8; 32] {
+pub fn compute_member_set_root(commitments: &[[u8; 32]]) -> [u8; 32] {
     let mut h = Sha256::new();
     for c in commitments {
         h.update(c);
     }
     h.finalize().into()
 }
-
-include!(concat!(env!("OUT_DIR"), "/methods.rs"));
-use PRIVATE_MULTISIG_GUEST_ID as IMAGE_ID;
-#[cfg(not(test))]
-const _: () = assert!(
-    IMAGE_ID[0] != 0 || IMAGE_ID[1] != 0,
-    "IMAGE_ID is all-zero; build the guest before deploying"
-);
 
 pub const ERR_PROOF_INVALID: u32 = 6001;
 pub const ERR_MULTISIG_MISMATCH: u32 = 6002;
@@ -52,6 +49,9 @@ pub const ERR_ALREADY_INITIALIZED: u32 = 6008;
 pub const ERR_TOO_MANY_MEMBERS: u32 = 6009;
 pub const ERR_INVALID_THRESHOLD: u32 = 6010;
 pub const ERR_TOO_MANY_PROPOSALS: u32 = 6011;
+/// `vote` was invoked by something other than the registered vote-circuit
+/// program. Only chained calls from that program carry a valid membership proof.
+pub const ERR_UNAUTHORIZED_CALLER: u32 = 6012;
 
 pub const MAX_MEMBERS: usize = 20;
 pub const MAX_PROPOSALS: usize = 100;
@@ -75,71 +75,17 @@ pub struct Proposal {
 pub struct MultisigState {
     /// M: minimum approvals needed.
     pub threshold: u8,
+    /// Program ID of the vote-circuit program authorized to deliver votes
+    /// (chained-call caller). Set once at initialization.
+    pub vote_circuit_program_id: [u32; 8],
     /// Registered member commitments: SHA256("member" || nsk || multisig_id).
     pub member_commitments: Vec<[u8; 32]>,
     /// Active and completed proposals.
     pub proposals: Vec<Proposal>,
 }
 
-/// Initialize a new multisig.
-///
-/// `member_commitments`: each member calls `derive_commitment(nsk, multisig_account_id)`
-/// off-chain and submits their result here. The nsk never leaves the client.
-pub fn initialize(
-    multisig_account: AccountWithMetadata,
-    threshold: u8,
-    member_commitments: Vec<[u8; 32]>,
-) -> Result<Vec<AccountPostState>, SpelError> {
-    if !multisig_account.account.data.as_ref().is_empty() {
-        return Err(SpelError::Custom { code: ERR_ALREADY_INITIALIZED, message: "multisig already initialized".to_string() });
-    }
-    if member_commitments.is_empty() || member_commitments.len() > MAX_MEMBERS {
-        return Err(SpelError::Custom { code: ERR_TOO_MANY_MEMBERS, message: "invalid member count".to_string() });
-    }
-    if threshold == 0 || threshold as usize > member_commitments.len() {
-        return Err(SpelError::Custom { code: ERR_INVALID_THRESHOLD, message: "invalid threshold".to_string() });
-    }
-
-    let state = MultisigState {
-        threshold,
-        member_commitments,
-        proposals: Vec::new(),
-    };
-    let mut account = multisig_account.account;
-    account.data = Data::try_from(borsh::to_vec(&state).expect("state serialise failed"))
-        .expect("state too large");
-    Ok(vec![AccountPostState::new(account)])
-}
-
-/// Submit a new proposal.
-///
-/// Any caller can submit a proposal -- only threshold approvals gate execution.
-pub fn submit_proposal(
-    multisig_account: AccountWithMetadata,
-    proposal_id: [u8; 32],
-    action_bytes: Vec<u8>,
-) -> Result<Vec<AccountPostState>, SpelError> {
-    let mut state = MultisigState::try_from_slice(multisig_account.account.data.as_ref())
-        .map_err(|_| SpelError::Custom { code: ERR_PROOF_INVALID, message: "state deserialise failed".to_string() })?;
-
-    if state.proposals.len() >= MAX_PROPOSALS {
-        return Err(SpelError::Custom { code: ERR_TOO_MANY_PROPOSALS, message: "proposal capacity reached".to_string() });
-    }
-    state.proposals.push(Proposal {
-        id: proposal_id,
-        action_bytes,
-        vote_count: 0,
-        executed: false,
-        spent_nullifiers: Vec::new(),
-    });
-
-    let mut account = multisig_account.account;
-    account.data = Data::try_from(borsh::to_vec(&state).expect("state serialise failed"))
-        .expect("state too large");
-    Ok(vec![AccountPostState::new(account)])
-}
-
-/// Decoded vote journal (public outputs from the RISC0 guest).
+/// Decoded vote journal (public outputs of the vote circuit, delivered as
+/// chained-call instruction data).
 pub struct VoteJournal {
     pub multisig_id: [u8; 32],
     pub proposal_id: [u8; 32],
@@ -148,8 +94,8 @@ pub struct VoteJournal {
 }
 
 /// Core vote validation against mutable multisig state.
-/// Separated from receipt parsing so the state-machine logic is unit-testable
-/// without a real RISC0 receipt.
+/// Separated from instruction plumbing so the state-machine logic is
+/// unit-testable without a chained-call context.
 pub fn apply_vote(
     state: &mut MultisigState,
     journal: &VoteJournal,
@@ -204,69 +150,4 @@ pub fn apply_execute(
 
     proposal.executed = true;
     Ok(())
-}
-
-/// Submit a vote receipt for a proposal.
-///
-/// The receipt proves the caller knows an nsk behind one of the registered
-/// member commitments, without revealing which one.
-pub fn vote(
-    multisig_account: AccountWithMetadata,
-    proposal_id: [u8; 32],
-    receipt_bytes: Vec<u8>,
-) -> Result<Vec<AccountPostState>, SpelError> {
-    let mut state = MultisigState::try_from_slice(multisig_account.account.data.as_ref())
-        .map_err(|_| SpelError::Custom { code: ERR_PROOF_INVALID, message: "state deserialise failed".to_string() })?;
-
-    let receipt: risc0_zkvm::Receipt = risc0_zkvm::serde::from_slice(&receipt_bytes)
-        .map_err(|_| SpelError::Custom { code: ERR_PROOF_INVALID, message: "receipt deserialise failed".to_string() })?;
-
-    receipt.verify(IMAGE_ID)
-        .map_err(|_| SpelError::Custom { code: ERR_PROOF_INVALID, message: "receipt verification failed".to_string() })?;
-
-    #[derive(serde::Deserialize)]
-    struct RawJournal {
-        multisig_id: [u8; 32],
-        proposal_id: [u8; 32],
-        nullifier: [u8; 32],
-        member_set_root: [u8; 32],
-    }
-
-    let j: RawJournal = receipt.journal.decode()
-        .map_err(|_| SpelError::Custom { code: ERR_PROOF_INVALID, message: "journal decode failed".to_string() })?;
-
-    let journal = VoteJournal {
-        multisig_id: j.multisig_id,
-        proposal_id: j.proposal_id,
-        nullifier: j.nullifier,
-        member_set_root: j.member_set_root,
-    };
-
-    let multisig_id: [u8; 32] = *multisig_account.account_id.value();
-    apply_vote(&mut state, &journal, multisig_id, proposal_id)?;
-
-    let mut account = multisig_account.account;
-    account.data = Data::try_from(borsh::to_vec(&state).expect("state serialise failed"))
-        .expect("state too large");
-    Ok(vec![AccountPostState::new(account)])
-}
-
-/// Execute a proposal once the threshold is met.
-///
-/// Marks the proposal executed and returns the updated account state.
-/// The caller reads `proposal.action_bytes` from the returned state and
-/// dispatches the encoded instruction to the target program.
-pub fn execute(
-    multisig_account: AccountWithMetadata,
-    proposal_id: [u8; 32],
-) -> Result<Vec<AccountPostState>, SpelError> {
-    let mut state = MultisigState::try_from_slice(multisig_account.account.data.as_ref())
-        .map_err(|_| SpelError::Custom { code: ERR_PROOF_INVALID, message: "state deserialise failed".to_string() })?;
-
-    apply_execute(&mut state, proposal_id)?;
-
-    let mut account = multisig_account.account;
-    account.data = Data::try_from(borsh::to_vec(&state).expect("state serialise failed"))
-        .expect("state too large");
-    Ok(vec![AccountPostState::new(account)])
 }

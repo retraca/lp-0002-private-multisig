@@ -80,6 +80,10 @@ enum ChainCmd {
         /// Program ID (64-char hex of 8 x u32 LE, from wallet deploy-program output).
         #[arg(long)]
         program_id: String,
+        /// Vote-circuit program ID (64-char hex). Votes are accepted only as
+        /// chained calls from this program.
+        #[arg(long)]
+        vote_circuit_program_id: String,
         /// Account signing key (64-char hex, from `chain keygen`).
         #[arg(long)]
         signing_key: String,
@@ -105,19 +109,36 @@ enum ChainCmd {
         #[arg(long, default_value = "")]
         action: String,
     },
-    /// Submit a vote receipt on-chain.
-    SubmitVote {
+    /// Cast a vote on-chain via a privacy-preserving transaction.
+    ///
+    /// Executes and proves the vote-circuit program locally (the nsk never
+    /// leaves this machine and never appears on-chain), composes the chained
+    /// call into the multisig program, and submits one privacy-preserving
+    /// transaction. RISC0_DEV_MODE=0 means real proving: expect minutes.
+    Vote {
         #[arg(long, default_value = "http://127.0.0.1:3040")]
         sequencer: String,
+        /// Multisig program ID (64-char hex).
         #[arg(long)]
         program_id: String,
+        /// Vote-circuit program ID must match the one registered at initialize.
+        /// Path to the vote-circuit program binary (R0BF).
+        #[arg(long, default_value = "programs/vote_circuit/vote_circuit.bin")]
+        vote_circuit_bin: PathBuf,
+        /// Path to the multisig program binary (R0BF).
+        #[arg(long, default_value = "programs/multisig/private_multisig.bin")]
+        multisig_bin: PathBuf,
         #[arg(long)]
         multisig_id: String,
         #[arg(long)]
         proposal_id: String,
-        /// Path to vote receipt (output of `multisig vote --out`).
+        /// Member nullifier secret key (64-char hex). PRIVATE: used only for
+        /// local proving.
         #[arg(long)]
-        receipt: PathBuf,
+        nsk: String,
+        /// Index of this member in the registered commitment list.
+        #[arg(long)]
+        member_index: u32,
     },
     /// Execute a proposal once the threshold is met.
     Execute {
@@ -196,10 +217,32 @@ fn encode_vec_u8(bytes: &[u8], out: &mut Vec<u32>) {
 }
 
 #[cfg_attr(not(feature = "chain"), allow(dead_code))]
-fn instr_initialize(threshold: u8, commitments: &[[u8; 32]]) -> Vec<u32> {
+fn instr_initialize(
+    threshold: u8,
+    vote_circuit_program_id: [u32; 8],
+    commitments: &[[u8; 32]],
+) -> Vec<u32> {
     let mut w = vec![0u32]; // variant 0
     w.push(threshold as u32);
+    w.extend_from_slice(&vote_circuit_program_id); // [u32; 8] = 8 words
     encode_vec_bytes32(commitments, &mut w);
+    w
+}
+
+/// Encode the vote-circuit program's `submit_vote` instruction (variant 0):
+/// multisig_program_id [u32;8], nsk [u8;32], member_index u32, proposal_id [u8;32].
+#[cfg_attr(not(feature = "chain"), allow(dead_code))]
+fn instr_vc_submit_vote(
+    multisig_program_id: [u32; 8],
+    nsk: &[u8; 32],
+    member_index: u32,
+    proposal_id: &[u8; 32],
+) -> Vec<u32> {
+    let mut w = vec![0u32]; // variant 0 (single instruction)
+    w.extend_from_slice(&multisig_program_id);
+    encode_bytes32(nsk, &mut w);
+    w.push(member_index);
+    encode_bytes32(proposal_id, &mut w);
     w
 }
 
@@ -329,6 +372,90 @@ mod chain {
             .context("get_account failed")?;
         Ok((account.data.as_ref().to_vec(), account.program_owner))
     }
+
+    /// Cast a vote via a privacy-preserving transaction.
+    ///
+    /// Client-side: executes and proves the vote-circuit program (initial
+    /// call, nsk as private input) plus the chained multisig vote call, then
+    /// wraps both in the PPE outer circuit proof. The sequencer verifies one
+    /// composite proof; instruction data of the initial call (the nsk) never
+    /// leaves this machine.
+    pub async fn send_vote_ppe(
+        sequencer: &str,
+        multisig_id: [u8; 32],
+        vote_circuit_bytecode: Vec<u8>,
+        multisig_bytecode: Vec<u8>,
+        instruction_data: Vec<u32>,
+    ) -> Result<String> {
+        use key_protocol::key_management::{KeyChain, ephemeral_key_holder::EphemeralKeyHolder};
+        use nssa::privacy_preserving_transaction::{
+            Message as PpeMessage, WitnessSet as PpeWitnessSet,
+            circuit::ProgramWithDependencies,
+        };
+        use nssa::program::Program;
+        use nssa_core::account::{Account, AccountWithMetadata};
+        use std::collections::HashMap;
+
+        let client = SequencerClientBuilder::default()
+            .build(sequencer)
+            .context("build sequencer client")?;
+
+        let account_id = AccountId::new(multisig_id);
+        let account = client
+            .get_account(account_id)
+            .await
+            .context("get_account failed")?;
+        let pre_state = AccountWithMetadata::new(account, false, account_id);
+
+        // Fresh zero-balance private "voter note": gives the transaction its
+        // required commitment/nullifier pair and makes the vote look like any
+        // other private transaction. The keys are throwaway.
+        let note_keys = KeyChain::new_os_random();
+        let note_npk = note_keys.nullifier_public_key;
+        let note_vpk = note_keys.viewing_public_key;
+        let note_pre = AccountWithMetadata::new(Account::default(), false, &note_npk);
+        let eph = EphemeralKeyHolder::new(&note_npk);
+        let note_ssk = eph.calculate_shared_secret_sender(&note_vpk);
+        let note_epk = eph.generate_ephemeral_public_key();
+
+        let vote_circuit =
+            Program::new(vote_circuit_bytecode).context("parse vote_circuit binary")?;
+        let multisig = Program::new(multisig_bytecode).context("parse multisig binary")?;
+        let mut dependencies = HashMap::new();
+        dependencies.insert(multisig.id(), multisig);
+        let pwd = ProgramWithDependencies::new(vote_circuit, dependencies);
+
+        eprintln!("Proving privacy-preserving execution (vote circuit + multisig chained call)...");
+        eprintln!("This runs the RISC0 prover locally; with RISC0_DEV_MODE=0 expect minutes.");
+        let (output, proof) = nssa::execute_and_prove(
+            vec![pre_state, note_pre],
+            instruction_data,
+            vec![0, 2],                    // public multisig account + fresh private note
+            vec![(note_npk, note_ssk)],    // note encryption keys
+            vec![],                        // no nsks: the note is unauthenticated (new)
+            vec![None],                    // membership proof slot for the new note
+            &pwd,
+        )
+        .map_err(|e| anyhow::anyhow!("execute_and_prove failed: {e:?}"))?;
+
+        let message = PpeMessage::try_from_circuit_output(
+            vec![account_id],
+            vec![], // no signer nonces: the multisig account is program-owned
+            vec![(note_npk, note_vpk, note_epk)],
+            output,
+        )
+        .map_err(|e| anyhow::anyhow!("message construction failed: {e:?}"))?;
+
+        let witness_set = PpeWitnessSet::for_message(&message, proof, &[]);
+        let tx = nssa::PrivacyPreservingTransaction::new(message, witness_set);
+
+        let hash = client
+            .send_transaction(NSSATransaction::PrivacyPreserving(tx))
+            .await
+            .context("send_transaction failed")?;
+
+        Ok(hex::encode(hash))
+    }
 }
 
 #[cfg(not(feature = "chain"))]
@@ -450,14 +577,15 @@ async fn main() -> Result<()> {
                     println!("program_owner: {owner_hex}");
                     println!("data ({} bytes): {}", data.len(), hex::encode(&data));
                 }
-                ChainCmd::Initialize { sequencer, program_id, signing_key, threshold, commitments } => {
+                ChainCmd::Initialize { sequencer, program_id, vote_circuit_program_id, signing_key, threshold, commitments } => {
                     let pid = parse_program_id(&program_id)?;
+                    let vc_pid = parse_program_id(&vote_circuit_program_id)?;
                     let key: nssa::PrivateKey = signing_key.parse()
                         .map_err(|e| anyhow::anyhow!("invalid signing key: {e:?}"))?;
                     let parsed: Result<Vec<[u8; 32]>> =
                         commitments.split(',').map(|s| parse_hex32(s.trim())).collect();
                     let parsed = parsed?;
-                    let instr = instr_initialize(threshold, &parsed);
+                    let instr = instr_initialize(threshold, vc_pid, &parsed);
                     let (hash, account_id) =
                         chain::send_signed_call(&sequencer, pid, &key, instr).await?;
                     println!("tx: {hash}");
@@ -476,30 +604,21 @@ async fn main() -> Result<()> {
                     let hash = chain::send_call(&sequencer, pid, mid, instr).await?;
                     println!("tx: {hash}");
                 }
-                ChainCmd::SubmitVote { sequencer, program_id, multisig_id, proposal_id, receipt } => {
+                ChainCmd::Vote { sequencer, program_id, vote_circuit_bin, multisig_bin, multisig_id, proposal_id, nsk, member_index } => {
                     let pid = parse_program_id(&program_id)?;
                     let mid = parse_hex32(&multisig_id)?;
                     let prop = parse_hex32(&proposal_id)?;
+                    let nsk_bytes = parse_hex32(&nsk)?;
 
-                    let raw = std::fs::read(&receipt).context("read receipt file")?;
-                    let receipt_words: Vec<u32> = raw.chunks_exact(4)
-                        .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
-                        .collect();
-                    let r: risc0_zkvm::Receipt = risc0_zkvm::serde::from_slice(&receipt_words)
-                        .map_err(|e| anyhow::anyhow!("deserialise receipt: {e}"))?;
+                    let vc_bytecode = std::fs::read(&vote_circuit_bin)
+                        .with_context(|| format!("read {}", vote_circuit_bin.display()))?;
+                    let ms_bytecode = std::fs::read(&multisig_bin)
+                        .with_context(|| format!("read {}", multisig_bin.display()))?;
 
-                    #[derive(serde::Deserialize, borsh::BorshSerialize)]
-                    struct Journal {
-                        multisig_id: [u8; 32],
-                        proposal_id: [u8; 32],
-                        nullifier: [u8; 32],
-                        member_set_root: [u8; 32],
-                    }
-                    let j: Journal = r.journal.decode()?;
-                    // Pass the borsh-encoded journal as journal_bytes to the vote instruction.
-                    let journal_bytes = borsh::to_vec(&j)?;
-                    let instr = instr_vote(&prop, &journal_bytes);
-                    let hash = chain::send_call(&sequencer, pid, mid, instr).await?;
+                    let instr = instr_vc_submit_vote(pid, &nsk_bytes, member_index, &prop);
+                    let hash = chain::send_vote_ppe(
+                        &sequencer, mid, vc_bytecode, ms_bytecode, instr,
+                    ).await?;
                     println!("tx: {hash}");
                 }
                 ChainCmd::Execute { sequencer, program_id, multisig_id, proposal_id } => {

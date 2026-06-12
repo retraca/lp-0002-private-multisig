@@ -1,10 +1,12 @@
 //! Guest binary entry point for LP-0002 private multisig on-chain program.
 //! Deploy with: cargo +risc0 build --release --target riscv32im-risc0-zkvm-elf
-//!              wallet deploy-program target/riscv32im-risc0-zkvm-elf/release/private_multisig
+//!              then package with scripts/package_r0bf.py and `wallet deploy-program`.
 //!
-//! Proof verification model: the vote receipt is passed as a zkVM assumption.
-//! The SPEL program calls env::verify(IMAGE_ID, journal_words) to bind the proof
-//! to this specific circuit -- the correct LEZ-native pattern (see privacy_preserving_circuit.rs).
+//! Proof model: votes arrive as chained calls from the vote-circuit program
+//! (`programs/vote_circuit`) inside a privacy-preserving transaction. The PPE
+//! outer circuit proves the chained-call linkage, so `vote` only needs to
+//! check `ctx.caller_program_id` against the registered vote-circuit program.
+//! No receipt or env::verify is needed here.
 
 #![no_main]
 
@@ -13,24 +15,22 @@ use nssa_core::account::{AccountWithMetadata, Data};
 use private_multisig_program::{
     apply_execute, apply_vote, MultisigState, Proposal, VoteJournal,
     ERR_INVALID_THRESHOLD, ERR_PROOF_INVALID, ERR_TOO_MANY_MEMBERS, ERR_TOO_MANY_PROPOSALS,
-    MAX_MEMBERS, MAX_PROPOSALS,
+    ERR_UNAUTHORIZED_CALLER, MAX_MEMBERS, MAX_PROPOSALS,
 };
-use risc0_zkvm::guest::env;
 use spel_framework::prelude::*;
-
-include!(concat!(env!("OUT_DIR"), "/methods.rs"));
-use PRIVATE_MULTISIG_GUEST_ID as IMAGE_ID;
 
 risc0_zkvm::guest::entry!(main);
 
 #[lez_program]
 mod multisig {
 
-    /// Initialize a new M-of-N multisig with member commitments and threshold.
+    /// Initialize a new M-of-N multisig with member commitments, threshold,
+    /// and the program ID of the vote-circuit program authorized to deliver votes.
     #[instruction]
     pub fn initialize(
         #[account(init)] mut multisig_account: AccountWithMetadata,
         threshold: u8,
+        vote_circuit_program_id: [u32; 8],
         member_commitments: Vec<[u8; 32]>,
     ) -> SpelResult {
         if member_commitments.is_empty() || member_commitments.len() > MAX_MEMBERS {
@@ -47,6 +47,7 @@ mod multisig {
         }
         let state = MultisigState {
             threshold,
+            vote_circuit_program_id,
             member_commitments,
             proposals: Vec::new(),
         };
@@ -98,13 +99,16 @@ mod multisig {
         Ok(SpelOutput::execute(vec![multisig_account], vec![]))
     }
 
-    /// Cast a vote via a RISC0 ZK proof of membership.
+    /// Cast a vote. Callable ONLY as a chained call from the registered
+    /// vote-circuit program: the PPE outer circuit proves the caller identity,
+    /// and the vote-circuit program only emits this call after recomputing the
+    /// member commitment from the voter's nsk.
     ///
-    /// The receipt for IMAGE_ID must be provided as a zkVM assumption before calling.
-    /// `journal_bytes` is borsh-serialized: [u8;32] multisig_id, [u8;32] proposal_id,
-    /// [u8;32] nullifier, [u8;32] member_set_root.
+    /// `journal_bytes` is borsh-serialized VoteJournal: [u8;32] multisig_id,
+    /// [u8;32] proposal_id, [u8;32] nullifier, [u8;32] member_set_root.
     #[instruction]
     pub fn vote(
+        ctx: ProgramContext,
         #[account(mut)] mut multisig_account: AccountWithMetadata,
         proposal_id: [u8; 32],
         journal_bytes: Vec<u8>,
@@ -116,15 +120,16 @@ mod multisig {
                     message: "state deserialise failed".to_string(),
                 })?;
 
-        let journal_words: Vec<u32> =
-            risc0_zkvm::serde::to_vec(&journal_bytes).map_err(|_| SpelError::Custom {
-                code: ERR_PROOF_INVALID,
-                message: "journal serialise failed".to_string(),
-            })?;
-        env::verify(IMAGE_ID, &journal_words).map_err(|_| SpelError::Custom {
-            code: ERR_PROOF_INVALID,
-            message: "assumption verification failed".to_string(),
-        })?;
+        // The membership proof is the caller itself: only the registered
+        // vote-circuit program emits this chained call, and the PPE circuit
+        // guarantees caller_program_id cannot be spoofed.
+        if ctx.caller_program_id != state.vote_circuit_program_id {
+            return Err(SpelError::Custom {
+                code: ERR_UNAUTHORIZED_CALLER,
+                message: "vote must arrive as a chained call from the vote-circuit program"
+                    .to_string(),
+            });
+        }
 
         #[derive(borsh::BorshDeserialize)]
         struct VoteJournalRaw {
