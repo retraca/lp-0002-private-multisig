@@ -1,15 +1,30 @@
 #!/usr/bin/env bash
 # LP-0002 private M-of-N multisig end-to-end demo (2-of-3).
 #
-# Runs fully offline: derives commitments, generates two vote proofs, verifies both.
-# Submitting votes to a live LEZ chain requires a running sequencer (see README).
+# Offline mode (default): derives commitments, generates two vote proofs, verifies both.
+# Chain mode (--chain):   also deploys and calls the on-chain SPEL program.
 #
-# Usage: ./demo.sh [--dev]   (--dev = RISC0_DEV_MODE=1 for fast local testing)
+# Usage:
+#   ./demo.sh [--dev] [--chain] [--sequencer <url>]
+#
+#   --dev        RISC0_DEV_MODE=1 (fast mock proofs, no ZK work)
+#   --chain      Run on-chain steps. Requires:
+#                  1. wallet deploy-program output path in PROGRAM_BIN (see below)
+#                  2. cargo build --release --features chain
+#                  3. A running sequencer (local docker or testnet)
+#
+# Testnet:
+#   SEQUENCER=https://testnet.lez.logos.co ./demo.sh --dev --chain
 
 set -euo pipefail
 
 DEV_MODE=0
-for arg in "$@"; do [ "$arg" = "--dev" ] && DEV_MODE=1; done
+CHAIN_MODE=0
+SEQUENCER="${SEQUENCER:-http://127.0.0.1:3040}"
+for arg in "$@"; do
+  [ "$arg" = "--dev" ]   && DEV_MODE=1
+  [ "$arg" = "--chain" ] && CHAIN_MODE=1
+done
 
 if [ "$DEV_MODE" = "1" ]; then
   export RISC0_DEV_MODE=1
@@ -18,16 +33,30 @@ else
   echo "[demo] Real RISC0 proofs -- proof generation takes several minutes per vote"
 fi
 
+# Build target: add --features chain when running on-chain steps.
+if [ "$CHAIN_MODE" = "1" ]; then
+  BIN_FEATURES="--features chain"
+else
+  BIN_FEATURES=""
+fi
+
 BIN="./target/release/multisig"
+# Program binary from wallet deploy-program (override with PROGRAM_BIN env var).
+# Produced by: wallet deploy-program programs/multisig/target/.../private_multisig
+PROGRAM_BIN="${PROGRAM_BIN:-}"
+# Program ID from deploy step (set below; override if already deployed).
+PROGRAM_ID="${PROGRAM_ID:-}"
 
 echo ""
 echo "=== LP-0002 Private M-of-N Multisig Demo (2-of-3) ==="
+echo "Sequencer: $SEQUENCER"
 echo ""
 
-echo "[1/6] Building..."
-cargo build --release --bin multisig 2>&1 | tail -3
+echo "[1/7] Building..."
+# shellcheck disable=SC2086
+cargo build --release --bin multisig $BIN_FEATURES 2>&1 | tail -3
 
-# Demo multisig account ID
+# Demo multisig account ID (deterministic -- same every run)
 MULTISIG_ID="cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
 
 # Three members with deterministic test nsks (never use outside demo)
@@ -36,7 +65,7 @@ NSK_2="2222222222222222222222222222222222222222222222222222222222222222"
 NSK_3="3333333333333333333333333333333333333333333333333333333333333333"
 
 echo ""
-echo "[2/6] Deriving member commitments (nsk stays local, never sent anywhere)..."
+echo "[2/7] Deriving member commitments (nsk stays local, never sent anywhere)..."
 COMMIT_1=$("$BIN" derive-commitment --nsk "$NSK_1" --multisig-id "$MULTISIG_ID")
 COMMIT_2=$("$BIN" derive-commitment --nsk "$NSK_2" --multisig-id "$MULTISIG_ID")
 COMMIT_3=$("$BIN" derive-commitment --nsk "$NSK_3" --multisig-id "$MULTISIG_ID")
@@ -48,10 +77,41 @@ PROPOSAL_ID="aaaa000000000000000000000000000000000000000000000000000000000001"
 MEMBER_COMMITMENTS="$COMMIT_1,$COMMIT_2,$COMMIT_3"
 
 echo ""
-echo "[3/6] (Skipped in offline demo) -- In production: deploy program + call initialize"
-echo "      threshold=2, commitments=[$COMMIT_1, $COMMIT_2, ...]"
+if [ "$CHAIN_MODE" = "1" ]; then
+  echo "[3/7] Deploying program + initializing multisig on-chain..."
+  if [ -z "$PROGRAM_ID" ] && [ -n "$PROGRAM_BIN" ]; then
+    echo "  Deploying program binary: $PROGRAM_BIN"
+    PROGRAM_ID=$(wallet deploy-program "$PROGRAM_BIN" | grep -oE '[0-9a-f]{64}' | head -1)
+    echo "  Program ID: $PROGRAM_ID"
+  elif [ -z "$PROGRAM_ID" ]; then
+    echo "  Skipping deploy (set PROGRAM_BIN=<path> or PROGRAM_ID=<hex> to run this step)"
+    echo "  Testnet program ID: 9abec04f2a082b6bf70f5a38f2dc967cc7605b3159a6713d93e62f76b0a55725"
+    PROGRAM_ID="${PROGRAM_ID:-9abec04f2a082b6bf70f5a38f2dc967cc7605b3159a6713d93e62f76b0a55725}"
+  fi
+  TX=$("$BIN" chain initialize \
+    --sequencer "$SEQUENCER" \
+    --program-id "$PROGRAM_ID" \
+    --multisig-id "$MULTISIG_ID" \
+    --threshold 2 \
+    --commitments "$MEMBER_COMMITMENTS")
+  echo "  Initialize tx: $TX"
+
+  echo ""
+  echo "  Submitting proposal..."
+  TX=$("$BIN" chain submit-proposal \
+    --sequencer "$SEQUENCER" \
+    --program-id "$PROGRAM_ID" \
+    --multisig-id "$MULTISIG_ID" \
+    --proposal-id "$PROPOSAL_ID" \
+    --action "7472616e73666572203130300a")
+  echo "  Proposal tx: $TX"
+else
+  echo "[3/7] On-chain init skipped (pass --chain to run on-chain steps)"
+  echo "      threshold=2, commitments=[$COMMIT_1, $COMMIT_2, ...]"
+fi
+
 echo ""
-echo "[4/6] Member 0 votes (proof generated locally, nsk never leaves this machine)..."
+echo "[4/7] Member 0 votes (proof generated locally, nsk never leaves this machine)..."
 "$BIN" vote \
   --nsk "$NSK_1" \
   --member-index 0 \
@@ -61,7 +121,7 @@ echo "[4/6] Member 0 votes (proof generated locally, nsk never leaves this machi
   --out /tmp/vote0.bin
 
 echo ""
-echo "[5/6] Member 1 votes..."
+echo "[5/7] Member 1 votes..."
 "$BIN" vote \
   --nsk "$NSK_2" \
   --member-index 1 \
@@ -71,21 +131,52 @@ echo "[5/6] Member 1 votes..."
   --out /tmp/vote1.bin
 
 echo ""
-echo "[6/6] Verifying both receipts offline..."
+echo "[6/7] Verifying both receipts offline..."
 "$BIN" verify --receipt /tmp/vote0.bin --multisig-id "$MULTISIG_ID" --proposal-id "$PROPOSAL_ID"
 "$BIN" verify --receipt /tmp/vote1.bin --multisig-id "$MULTISIG_ID" --proposal-id "$PROPOSAL_ID"
+
+echo ""
+if [ "$CHAIN_MODE" = "1" ]; then
+  echo "[7/7] Submitting votes on-chain and executing..."
+  TX=$("$BIN" chain submit-vote \
+    --sequencer "$SEQUENCER" \
+    --program-id "$PROGRAM_ID" \
+    --multisig-id "$MULTISIG_ID" \
+    --proposal-id "$PROPOSAL_ID" \
+    --receipt /tmp/vote0.bin)
+  echo "  Vote 0 tx: $TX"
+
+  TX=$("$BIN" chain submit-vote \
+    --sequencer "$SEQUENCER" \
+    --program-id "$PROGRAM_ID" \
+    --multisig-id "$MULTISIG_ID" \
+    --proposal-id "$PROPOSAL_ID" \
+    --receipt /tmp/vote1.bin)
+  echo "  Vote 1 tx: $TX"
+
+  TX=$("$BIN" chain execute \
+    --sequencer "$SEQUENCER" \
+    --program-id "$PROGRAM_ID" \
+    --multisig-id "$MULTISIG_ID" \
+    --proposal-id "$PROPOSAL_ID")
+  echo "  Execute tx: $TX"
+else
+  echo "[7/7] On-chain submit skipped (pass --chain to run on-chain steps)"
+fi
 
 echo ""
 echo "=== Demo complete ==="
 echo "Vote receipts: /tmp/vote0.bin /tmp/vote1.bin"
 echo ""
-echo "To submit to a running LEZ chain, deploy programs/multisig and call:"
-echo "  vote(multisig_account, proposal_id, receipt_bytes)  -- for each receipt"
-echo "  execute(multisig_account, proposal_id)              -- once threshold is met"
+if [ "$CHAIN_MODE" = "0" ]; then
+  echo "To run the full on-chain demo:"
+  echo "  cargo build --release --features chain"
+  echo "  SEQUENCER=https://testnet.lez.logos.co ./demo.sh --dev --chain"
+fi
 echo ""
 echo "Privacy properties:"
 echo "  - nsk never leaves the client"
 echo "  - On-chain observers see that M proofs were accepted, not which members voted"
-echo "  - member_set_root binds the receipt to the registered set without revealing the voter"
+echo "  - member_set_root binds the proof to the registered set without revealing the voter"
 echo "  - Per-proposal nullifiers prevent double-voting"
 echo "  - LEZ nonce constraint avoided: voting commitments are separate from shielded accounts"
