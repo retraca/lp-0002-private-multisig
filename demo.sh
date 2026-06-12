@@ -111,15 +111,20 @@ if [ "$CHAIN_MODE" = "1" ]; then
     --vote-circuit-program-id "$VOTE_CIRCUIT_PROGRAM_ID" \
     --signing-key "$SIGNING_KEY" \
     --threshold 2 \
-    --commitments "$MEMBER_COMMITMENTS")
+    --commitments "$MEMBER_COMMITMENTS" | grep '^tx:' | awk '{print $2}')
   echo "  Initialize tx: $TX"
   echo "  Waiting for inclusion..."
+  INITIALIZED=0
   for i in $(seq 1 24); do
     STATE=$("$BIN" chain state --sequencer "$SEQUENCER" --multisig-id "$MULTISIG_ID" 2>/dev/null || true)
-    echo "$STATE" | grep -q "program_owner: $PROGRAM_ID" && break
+    if echo "$STATE" | grep -q "program_owner: $PROGRAM_ID"; then INITIALIZED=1; break; fi
     sleep 5
   done
   "$BIN" chain state --sequencer "$SEQUENCER" --multisig-id "$MULTISIG_ID"
+  if [ "$INITIALIZED" != "1" ]; then
+    echo "ERROR: initialize did not land (is program $PROGRAM_ID deployed on this sequencer?)" >&2
+    exit 1
+  fi
 
   echo ""
   echo "  Submitting proposal (unsigned: the account is now program-owned)..."
@@ -131,11 +136,16 @@ if [ "$CHAIN_MODE" = "1" ]; then
     --action "7472616e73666572203130300a")
   echo "  Proposal tx: $TX"
   echo "  Waiting for inclusion..."
+  PROPOSED=0
   for i in $(seq 1 24); do
-    "$BIN" chain state --sequencer "$SEQUENCER" --multisig-id "$MULTISIG_ID" 2>/dev/null \
-      | grep -q "${PROPOSAL_ID:0:8}" && break
+    if "$BIN" chain state --sequencer "$SEQUENCER" --multisig-id "$MULTISIG_ID" 2>/dev/null \
+      | grep -q "${PROPOSAL_ID:0:8}"; then PROPOSED=1; break; fi
     sleep 5
   done
+  if [ "$PROPOSED" != "1" ]; then
+    echo "ERROR: proposal did not land" >&2
+    exit 1
+  fi
 else
   echo "[3/7] On-chain init skipped (pass --chain to run on-chain steps)"
   echo "      threshold=2, commitments=[$COMMIT_1, $COMMIT_2, ...]"
@@ -182,6 +192,16 @@ if [ "$CHAIN_MODE" = "1" ]; then
     --nsk "$NSK_1" \
     --member-index 0 | grep '^tx:' | awk '{print $2}')
   echo "  Vote 0 tx: $TX"
+  # Wait for vote 0 to land before proving vote 1: each vote's proof commits
+  # to the multisig pre-state, so votes must be sequential.
+  echo "  Waiting for vote 0 to land..."
+  V0=0
+  for i in $(seq 1 24); do
+    if "$BIN" chain state --sequencer "$SEQUENCER" --multisig-id "$MULTISIG_ID" 2>/dev/null \
+      | grep -qE "data \(224 bytes\)"; then V0=1; break; fi
+    sleep 5
+  done
+  if [ "$V0" != "1" ]; then echo "ERROR: vote 0 did not land" >&2; exit 1; fi
 
   TX=$("$BIN" chain vote \
     --sequencer "$SEQUENCER" \
@@ -192,23 +212,36 @@ if [ "$CHAIN_MODE" = "1" ]; then
     --member-index 1 | grep '^tx:' | awk '{print $2}')
   echo "  Vote 1 tx: $TX"
 
-  echo "  Waiting for votes to land..."
-  for i in $(seq 1 36); do
-    DATA=$("$BIN" chain state --sequencer "$SEQUENCER" --multisig-id "$MULTISIG_ID" 2>/dev/null | grep '^data' || true)
-    echo "$DATA" | grep -qE "\(255 bytes\)" && break
+  echo "  Waiting for vote 1 to land..."
+  V1=0
+  for i in $(seq 1 24); do
+    if "$BIN" chain state --sequencer "$SEQUENCER" --multisig-id "$MULTISIG_ID" 2>/dev/null \
+      | grep -qE "data \(256 bytes\)"; then V1=1; break; fi
     sleep 5
   done
+  if [ "$V1" != "1" ]; then echo "ERROR: vote 1 did not land" >&2; exit 1; fi
 
   TX=$("$BIN" chain execute \
     --sequencer "$SEQUENCER" \
     --program-id "$PROGRAM_ID" \
     --multisig-id "$MULTISIG_ID" \
-    --proposal-id "$PROPOSAL_ID")
+    --proposal-id "$PROPOSAL_ID" | grep '^tx:' | awk '{print $2}')
   echo "  Execute tx: $TX"
-  sleep 12
+  echo "  Waiting for execution to land..."
+  EXECUTED=0
+  for i in $(seq 1 24); do
+    STATE=$("$BIN" chain state --sequencer "$SEQUENCER" --multisig-id "$MULTISIG_ID" 2>/dev/null || true)
+    # borsh tail: vote_count=02, executed=01, nullifier count=02000000
+    if echo "$STATE" | grep -q "020102000000"; then EXECUTED=1; break; fi
+    sleep 5
+  done
   echo ""
   echo "  Final multisig state (vote_count=2, executed=true, 2 spent nullifiers):"
   "$BIN" chain state --sequencer "$SEQUENCER" --multisig-id "$MULTISIG_ID"
+  if [ "$EXECUTED" != "1" ]; then
+    echo "ERROR: proposal not executed on-chain" >&2
+    exit 1
+  fi
 else
   echo "[7/7] On-chain submit skipped (pass --chain to run on-chain steps)"
 fi
