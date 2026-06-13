@@ -14,13 +14,15 @@ OUT="${2:-/tmp/lp0002-demo.mp4}"
 GIF="${OUT%.mp4}.gif"
 
 # Compress idle to 3s max, slightly faster playback, readable font.
-agg --idle-time-limit 3 --speed 1.4 --font-size 20 --theme monokai \
-    --fps-cap 15 "$CAST" "$GIF"
+# Large font for a crisp, modern, full-HD look (native ~1580x1120).
+agg --idle-time-limit 25 --speed 1.0 --font-size 32 --font-family "Menlo" \
+    --line-height 1.4 --theme monokai --fps-cap 12 "$CAST" "$GIF"
 
-# GIF -> MP4 (H.264, yuv420p for universal playback). Pad to even dimensions.
+# GIF -> 1080p MP4: scale to fit, center on a matching dark background so it
+# reads like a full-screen terminal recording.
 ffmpeg -y -i "$GIF" \
-    -vf "scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p" \
-    -movflags +faststart "$OUT"
+    -vf "scale=-2:1040,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=0x272822,format=yuv420p" \
+    -r 24 -movflags +faststart "$OUT"
 
 echo "wrote $OUT"
 ffprobe -v error -show_entries format=duration -of csv=p=0 "$OUT" \
