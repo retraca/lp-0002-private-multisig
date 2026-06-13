@@ -1,1 +1,5 @@
 target/
+
+# demo videos: local only, never committed
+docs/*.mp4
+*.gif
