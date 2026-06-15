@@ -88,3 +88,13 @@ Deployed on the hosted LEZ testnet (`https://testnet.lez.logos.co`) — program 
 ## License
 
 MIT or Apache-2.0
+
+## Why not Semaphore or MACI?
+
+**Semaphore** is an EVM Groth16 circuit that proves group membership via a nullifier. It is chain-agnostic in principle, but its identity commitment is a Pedersen hash over a Poseidon-hashed secret, whereas LEZ already provides SHA256-based commitments; mixing two hash primitives inside one guest adds proof-size overhead. Semaphore is also group-membership only: it has no first-class multisig state machine (threshold, proposals, per-proposal nullifier sets), so the custom state machine would be needed regardless.
+
+**MACI** (Minimum Anti-Collusion Infrastructure) solves a different problem: preventing vote-buying by making votes private even to the voter after submission via an operator-mediated tally. It is designed for quadratic voting with many participants, not M-of-N threshold execution. The multisig case needs the opposite guarantee: members must be able to confirm their own vote was counted before execution.
+
+## Security
+
+See [docs/SECURITY.md](docs/SECURITY.md) for the full threat model: trusted setup, membership-set privacy under chain analysis, sequencer adversary, nullifier unlinkability, and known limitations.
