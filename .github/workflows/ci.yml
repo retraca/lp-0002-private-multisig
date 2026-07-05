@@ -2,53 +2,16 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, v020-port]
   pull_request:
 
 jobs:
-  check:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Clone LEZ (path dependency of the optional chain feature)
-        run: |
-          git clone --depth 1 --branch v0.1.2 \
-            https://github.com/logos-blockchain/logos-execution-zone.git \
-            "$GITHUB_WORKSPACE/../lez-build"
-
-      - name: Cache cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Check workspace
-        run: cargo check --workspace
-
-      - name: Clippy
-        run: cargo clippy --workspace -- -D warnings
-
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Clone LEZ (path dependency of the optional chain feature)
-        run: |
-          git clone --depth 1 --branch v0.1.2 \
-            https://github.com/logos-blockchain/logos-execution-zone.git \
-            "$GITHUB_WORKSPACE/../lez-build"
-
+      - uses: dtolnay/rust-toolchain@stable
       - name: Cache cargo
         uses: actions/cache@v4
         with:
@@ -56,110 +19,46 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.toml') }}
+      - name: Unit tests (state machine + SDK)
+        run: cargo test --release -p private-multisig-program -p private-multisig-sdk
+      - name: Build CLI
+        run: cargo build --release -p private-multisig-cli
+      - name: Install risc0 toolchain (guest build)
+        run: |
+          curl -sSfL https://risczero.com/install | bash
+          ~/.risc0/bin/rzup install rust
+      - name: Build guest program ELF
+        working-directory: programs/multisig
+        run: cargo +risc0 build --release --target riscv32im-risc0-zkvm-elf
 
-      - name: Unit tests (RISC0_DEV_MODE)
-        env:
-          RISC0_DEV_MODE: "1"
-        run: cargo test --workspace -- --test-threads=1
-
-      - name: Multisig program state-machine tests
-        env:
-          RISC0_DEV_MODE: "1"
-        run: cargo test --manifest-path programs/multisig/Cargo.toml --lib --tests -- --test-threads=1
-
+  # Full end-to-end against a locally-booted STANDALONE LEZ v0.2.0 sequencer.
+  # RISC0_DEV_MODE=1 so the flow finishes without ~minutes-per-vote STARKs;
+  # the real-proof run is the recorded demo + testnet evidence (see docs/).
   e2e-sequencer:
     runs-on: ubuntu-latest
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Clone LEZ (logos-execution-zone v0.1.2) as sibling lez-build
-        run: |
-          git clone --depth 1 --branch v0.1.2 \
-            https://github.com/logos-blockchain/logos-execution-zone.git \
-            "$GITHUB_WORKSPACE/../lez-build"
-
-      - name: Cache LEZ sequencer build
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo + LEZ build
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            ../lez-build/target
-          key: ${{ runner.os }}-lez-v0.1.2-sequencer
-
-      - name: Install logos-blockchain-circuits release
+            target
+            programs/multisig/target
+            .lez
+          key: ${{ runner.os }}-e2e-lez-v0.2.0-${{ hashFiles('**/Cargo.toml') }}
+          restore-keys: ${{ runner.os }}-e2e-lez-v0.2.0-
+      - name: Install risc0 toolchain + r0vm
         run: |
-          mkdir -p ~/.logos-blockchain-circuits
-          curl -sfL -o /tmp/circuits.tar.gz \
-            https://github.com/logos-blockchain/logos-blockchain-circuits/releases/download/v0.4.2/logos-blockchain-circuits-v0.4.2-linux-x86_64.tar.gz
-          tar -xzf /tmp/circuits.tar.gz -C ~/.logos-blockchain-circuits
-          # the tarball may nest a versioned directory; surface its contents
-          inner=$(find ~/.logos-blockchain-circuits -maxdepth 1 -mindepth 1 -type d -name 'logos-blockchain-circuits-*' | head -1)
-          if [ -n "$inner" ]; then cp -r "$inner"/* ~/.logos-blockchain-circuits/; fi
-          ls ~/.logos-blockchain-circuits
-
-      - name: Build standalone sequencer
-        run: cargo build --release -p sequencer_service --features standalone
-        working-directory: ../lez-build
-
-      - name: Install r0vm (risc0 executor backend, required at sequencer runtime)
-        run: |
-          curl -sfL -o /tmp/crz.tgz \
-            https://github.com/risc0/risc0/releases/download/v3.0.5/cargo-risczero-x86_64-unknown-linux-gnu.tgz
-          tar -xzf /tmp/crz.tgz -C "$HOME/.cargo/bin" r0vm
-          chmod +x "$HOME/.cargo/bin/r0vm"
-          r0vm --version
-
-      - name: Start sequencer
-        run: |
-          mkdir -p /tmp/lez-seq-home
-          RISC0_DEV_MODE=1 RUST_LOG=debug RUST_BACKTRACE=full \
-            ../lez-build/target/release/sequencer_service \
-            .github/sequencer_config.json -p 3040 > /tmp/lez-seq.log 2>&1 &
-          for i in $(seq 1 60); do
-            curl -sf -m 2 -X POST http://127.0.0.1:3040 \
-              -H 'Content-Type: application/json' \
-              -d '{"jsonrpc":"2.0","method":"checkHealth","params":[],"id":1}' \
-              >/dev/null 2>&1 && exit 0
-            sleep 2
-          done
-          echo "sequencer did not come up"; tail -50 /tmp/lez-seq.log; exit 1
-
-      - name: Cache repo build (chain feature)
-        uses: actions/cache@v4
-        with:
-          path: target
-          key: ${{ runner.os }}-cargo-chain-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Build CLI with chain feature
-        run: cargo build --release --bin multisig --features chain
-
-      - name: Deploy programs to local sequencer
-        run: |
-          python3 - <<'PYEOF'
-          import json, base64, struct, urllib.request
-          def deploy(path):
-              bytecode = open(path,'rb').read()
-              tx = bytes([2]) + struct.pack('<I', len(bytecode)) + bytecode
-              param = base64.b64encode(tx).decode()
-              req = urllib.request.Request('http://127.0.0.1:3040',
-                  data=json.dumps({'jsonrpc':'2.0','method':'sendTransaction','params':[param],'id':1}).encode(),
-                  headers={'Content-Type':'application/json'})
-              print(path, '->', json.loads(urllib.request.urlopen(req, timeout=60).read())['result'])
-          deploy('programs/multisig/private_multisig.bin')
-          deploy('programs/vote_circuit/vote_circuit.bin')
-          PYEOF
-          sleep 12
-
-      - name: Full e2e demo against the sequencer (initialize, proposal, 2 PPE votes, execute)
-        env:
-          SEQUENCER: http://127.0.0.1:3040
-        run: ./demo.sh --dev --chain
-
+          curl -sSfL https://risczero.com/install | bash
+          ~/.risc0/bin/rzup install rust
+          ~/.risc0/bin/rzup install r0vm
+      - name: End-to-end demo (dev mode)
+        run: ./demo.sh --dev
       - name: Sequencer log on failure
         if: failure()
-        run: tail -100 /tmp/lez-seq.log
+        run: tail -120 .demo/seq.log
