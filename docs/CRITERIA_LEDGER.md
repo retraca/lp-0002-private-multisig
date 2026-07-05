@@ -5,6 +5,13 @@ Source of truth: live spec pulled 2026-07-03 via
 Statuses: VERIFIED (ran this session, saw it pass) · BUILDER-ONLY (needs the
 builder) · CLAIMED (doc says done, not re-run) · PARTIAL · MISSING.
 
+Progress 2026-07-05: full v0.2.0 port landed on branch v020-port. Dev-mode
+e2e (deploy → init → proposal → fund riders → 2 anonymous votes → kill-9
+resume → double-vote rejected ERR_6004 → execute) PASSED on the build VM,
+DEMO_RC=0 (~/demo-dev.out 22:13 UTC). Real-proof run + testnet redeploy in
+flight. Unit tests 6+1 green. In-circuit live-rider binding implemented
+(guest asserts + LEZ privacy circuit membership).
+
 Context that resets everything: the hosted testnet was wiped and now runs
 **LEZ v0.2.0** (tag `v0.2.0`, commit `a58fbce2`). All prior v0.1.2 evidence in
 docs/TESTNET_EVIDENCE.md is SUPERSEDED. Reviewer feedback on competing PR #91
