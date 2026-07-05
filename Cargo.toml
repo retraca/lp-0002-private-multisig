@@ -1,9 +1,10 @@
 [workspace]
 members = [
-    "circuit/guest",
-    "circuit/host",
+    "cli",
     "sdk",
 ]
-# programs/* depend on nssa-core (private LEZ dep) -- not compilable standalone
-exclude = ["programs/multisig", "programs/vote_circuit"]
+# The guest program builds separately for the riscv32im-risc0-zkvm-elf target
+# (its own .cargo/config.toml carries the guest rustflags):
+#   cd programs/multisig && cargo +risc0 build --release --target riscv32im-risc0-zkvm-elf
+exclude = ["programs/multisig"]
 resolver = "2"

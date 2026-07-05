@@ -1,191 +1,148 @@
-//! Guest binary entry point for LP-0002 private multisig on-chain program.
-//! Deploy with: cargo +risc0 build --release --target riscv32im-risc0-zkvm-elf
-//!              then package with scripts/package_r0bf.py and `wallet deploy-program`.
+//! Guest binary for the LP-0002 private multisig program (LEZ v0.2.0).
 //!
-//! Proof model: votes arrive as chained calls from the vote-circuit program
-//! (`programs/vote_circuit`) inside a privacy-preserving transaction. The PPE
-//! outer circuit proves the chained-call linkage, so `vote` only needs to
-//! check `ctx.caller_program_id` against the registered vote-circuit program.
-//! No receipt or env::verify is needed here.
-
-#![no_main]
+//! Build: cargo +risc0 build --release --target riscv32im-risc0-zkvm-elf -p private-multisig-program
+//! Deploy: `multisig chain deploy --program-bin <elf>` (or the stock wallet).
+//!
+//! Failure model: every invalid input aborts via panic whose message carries a
+//! documented `ERR_<code>` (see lib.rs). For public transactions the sequencer
+//! rejects the transaction; for the privacy-preserving `Vote` the proof simply
+//! cannot be produced, so an invalid vote never even reaches the chain.
 
 use borsh::BorshDeserialize;
-use nssa_core::account::{AccountWithMetadata, Data};
+use lee_core::account::{Account, AccountId, AccountWithMetadata};
+use lee_core::program::{read_lee_inputs, AccountPostState, Claim, ProgramInput, ProgramOutput};
+use lee_core::NullifierPublicKey;
 use private_multisig_program::{
-    apply_execute, apply_vote, MultisigState, Proposal, VoteJournal,
-    ERR_INVALID_THRESHOLD, ERR_PROOF_INVALID, ERR_TOO_MANY_MEMBERS, ERR_TOO_MANY_PROPOSALS,
-    ERR_UNAUTHORIZED_CALLER, MAX_MEMBERS, MAX_PROPOSALS,
+    apply_execute, apply_submit_proposal, apply_vote, MultisigInstruction, MultisigState,
+    ERR_ALREADY_INITIALIZED, ERR_PROOF_INVALID, ERR_RIDER_MISMATCH, ERR_RIDER_NOT_LIVE,
+    VOTE_IDENTIFIER,
 };
-use spel_framework::prelude::*;
 
-risc0_zkvm::guest::entry!(main);
+fn state_of(account: &AccountWithMetadata) -> MultisigState {
+    MultisigState::try_from_slice(account.account.data.as_ref())
+        .unwrap_or_else(|_| panic!("ERR_{ERR_PROOF_INVALID} multisig state deserialize failed"))
+}
 
-#[lez_program]
-mod multisig {
+fn with_state(mut account: Account, state: &MultisigState) -> Account {
+    account.data = borsh::to_vec(state)
+        .expect("state serialize")
+        .try_into()
+        .expect("multisig state fits into account data limit");
+    account
+}
 
-    /// Initialize a new M-of-N multisig with member commitments, threshold,
-    /// and the program ID of the vote-circuit program authorized to deliver votes.
-    #[instruction]
-    pub fn initialize(
-        #[account(init)] mut multisig_account: AccountWithMetadata,
-        threshold: u8,
-        vote_circuit_program_id: [u32; 8],
-        member_commitments: Vec<[u8; 32]>,
-    ) -> SpelResult {
-        if member_commitments.is_empty() || member_commitments.len() > MAX_MEMBERS {
-            return Err(SpelError::Custom {
-                code: ERR_TOO_MANY_MEMBERS,
-                message: "invalid member count".to_string(),
-            });
-        }
-        if threshold == 0 || threshold as usize > member_commitments.len() {
-            return Err(SpelError::Custom {
-                code: ERR_INVALID_THRESHOLD,
-                message: "invalid threshold".to_string(),
-            });
-        }
-        let state = MultisigState {
+fn main() {
+    let (
+        ProgramInput {
+            self_program_id,
+            caller_program_id,
+            pre_states,
+            instruction,
+        },
+        instruction_words,
+    ) = read_lee_inputs::<MultisigInstruction>();
+
+    let post_states = match instruction {
+        // Claim the (signed) multisig account and register the member set.
+        MultisigInstruction::Initialize {
             threshold,
-            vote_circuit_program_id,
-            member_commitments,
-            proposals: Vec::new(),
-        };
-        multisig_account.account.data =
-            Data::try_from(borsh::to_vec(&state).map_err(|e| SpelError::SerializationError {
-                message: e.to_string(),
-            })?)
-            .map_err(|e| SpelError::SerializationError {
-                message: format!("state too large: {e:?}"),
-            })?;
-        Ok(SpelOutput::execute(vec![multisig_account], vec![]))
-    }
-
-    /// Submit a new proposal with opaque action bytes.
-    #[instruction]
-    pub fn submit_proposal(
-        #[account(mut)] mut multisig_account: AccountWithMetadata,
-        proposal_id: [u8; 32],
-        action_bytes: Vec<u8>,
-    ) -> SpelResult {
-        let mut state =
-            MultisigState::try_from_slice(multisig_account.account.data.as_ref())
-                .map_err(|_| SpelError::Custom {
-                    code: ERR_PROOF_INVALID,
-                    message: "state deserialise failed".to_string(),
-                })?;
-
-        if state.proposals.len() >= MAX_PROPOSALS {
-            return Err(SpelError::Custom {
-                code: ERR_TOO_MANY_PROPOSALS,
-                message: "proposal capacity reached".to_string(),
-            });
-        }
-        state.proposals.push(Proposal {
-            id: proposal_id,
-            action_bytes,
-            vote_count: 0,
-            executed: false,
-            spent_nullifiers: Vec::new(),
-        });
-
-        multisig_account.account.data =
-            Data::try_from(borsh::to_vec(&state).map_err(|e| SpelError::SerializationError {
-                message: e.to_string(),
-            })?)
-            .map_err(|e| SpelError::SerializationError {
-                message: format!("state too large: {e:?}"),
-            })?;
-        Ok(SpelOutput::execute(vec![multisig_account], vec![]))
-    }
-
-    /// Cast a vote. Callable ONLY as a chained call from the registered
-    /// vote-circuit program: the PPE outer circuit proves the caller identity,
-    /// and the vote-circuit program only emits this call after recomputing the
-    /// member commitment from the voter's nsk.
-    ///
-    /// `journal_bytes` is borsh-serialized VoteJournal: [u8;32] multisig_id,
-    /// [u8;32] proposal_id, [u8;32] nullifier, [u8;32] member_set_root.
-    #[instruction]
-    pub fn vote(
-        ctx: ProgramContext,
-        #[account(mut)] mut multisig_account: AccountWithMetadata,
-        proposal_id: [u8; 32],
-        journal_bytes: Vec<u8>,
-    ) -> SpelResult {
-        let mut state =
-            MultisigState::try_from_slice(multisig_account.account.data.as_ref())
-                .map_err(|_| SpelError::Custom {
-                    code: ERR_PROOF_INVALID,
-                    message: "state deserialise failed".to_string(),
-                })?;
-
-        // The membership proof is the caller itself: only the registered
-        // vote-circuit program emits this chained call, and the PPE circuit
-        // guarantees caller_program_id cannot be spoofed.
-        if ctx.caller_program_id != state.vote_circuit_program_id {
-            return Err(SpelError::Custom {
-                code: ERR_UNAUTHORIZED_CALLER,
-                message: "vote must arrive as a chained call from the vote-circuit program"
-                    .to_string(),
-            });
+            commitments,
+        } => {
+            let Ok([multisig]) = <[_; 1]>::try_from(pre_states.clone()) else {
+                return;
+            };
+            assert!(
+                multisig.account == Account::default(),
+                "ERR_{ERR_ALREADY_INITIALIZED} multisig account already initialized"
+            );
+            MultisigState::validate_new(threshold, &commitments)
+                .unwrap_or_else(|e| panic!("{e}"));
+            let state = MultisigState {
+                threshold,
+                member_commitments: commitments,
+                proposals: Vec::new(),
+            };
+            vec![AccountPostState::new_claimed(
+                with_state(multisig.account, &state),
+                Claim::Authorized,
+            )]
         }
 
-        #[derive(borsh::BorshDeserialize)]
-        struct VoteJournalRaw {
-            multisig_id: [u8; 32],
-            proposal_id: [u8; 32],
-            nullifier: [u8; 32],
-            member_set_root: [u8; 32],
+        // Record a proposal on the program-owned account (unsigned).
+        MultisigInstruction::SubmitProposal {
+            proposal_id,
+            action,
+        } => {
+            let Ok([multisig]) = <[_; 1]>::try_from(pre_states.clone()) else {
+                return;
+            };
+            let mut state = state_of(&multisig);
+            apply_submit_proposal(&mut state, proposal_id, action)
+                .unwrap_or_else(|e| panic!("{e}"));
+            vec![AccountPostState::new(with_state(multisig.account, &state))]
         }
 
-        let j = VoteJournalRaw::try_from_slice(&journal_bytes).map_err(|_| SpelError::Custom {
-            code: ERR_PROOF_INVALID,
-            message: "journal decode failed".to_string(),
-        })?;
+        // Anonymous approval: privacy-preserving initial call, nsk private.
+        MultisigInstruction::Vote {
+            nsk,
+            member_index,
+            proposal_id,
+        } => {
+            let Ok([multisig, rider]) = <[_; 2]>::try_from(pre_states.clone()) else {
+                return;
+            };
+            let multisig_id: [u8; 32] = multisig
+                .account_id
+                .as_ref()
+                .try_into()
+                .expect("account id is 32 bytes");
 
-        let journal = VoteJournal {
-            multisig_id: j.multisig_id,
-            proposal_id: j.proposal_id,
-            nullifier: j.nullifier,
-            member_set_root: j.member_set_root,
-        };
+            // In-circuit live-account binding: the rider must BE the member's
+            // shielded voting account derived from the SAME nsk, and it must
+            // already exist on chain (the LEZ privacy circuit proves its
+            // pre-state commitment is in the live commitment tree).
+            let expected_rider = AccountId::for_regular_private_account(
+                &NullifierPublicKey::from(&nsk),
+                VOTE_IDENTIFIER,
+            );
+            assert!(
+                rider.account_id == expected_rider,
+                "ERR_{ERR_RIDER_MISMATCH} rider is not the voting account derived from this nsk"
+            );
+            assert!(
+                rider.account != Account::default(),
+                "ERR_{ERR_RIDER_NOT_LIVE} rider must be a live shielded account"
+            );
 
-        let multisig_id: [u8; 32] = *multisig_account.account_id.value();
-        apply_vote(&mut state, &journal, multisig_id, proposal_id)?;
+            let mut state = state_of(&multisig);
+            apply_vote(&mut state, &nsk, member_index, proposal_id, multisig_id)
+                .unwrap_or_else(|e| panic!("{e}"));
 
-        multisig_account.account.data =
-            Data::try_from(borsh::to_vec(&state).map_err(|e| SpelError::SerializationError {
-                message: e.to_string(),
-            })?)
-            .map_err(|e| SpelError::SerializationError {
-                message: format!("state too large: {e:?}"),
-            })?;
-        Ok(SpelOutput::execute(vec![multisig_account], vec![]))
-    }
+            // The rider passes through unchanged; the privacy circuit rotates
+            // its commitment + nonce like any private transfer.
+            vec![
+                AccountPostState::new(with_state(multisig.account, &state)),
+                AccountPostState::new(rider.account),
+            ]
+        }
 
-    /// Execute a proposal once the threshold is met.
-    #[instruction]
-    pub fn execute(
-        #[account(mut)] mut multisig_account: AccountWithMetadata,
-        proposal_id: [u8; 32],
-    ) -> SpelResult {
-        let mut state =
-            MultisigState::try_from_slice(multisig_account.account.data.as_ref())
-                .map_err(|_| SpelError::Custom {
-                    code: ERR_PROOF_INVALID,
-                    message: "state deserialise failed".to_string(),
-                })?;
+        // Threshold-gated execution (unsigned).
+        MultisigInstruction::Execute { proposal_id } => {
+            let Ok([multisig]) = <[_; 1]>::try_from(pre_states.clone()) else {
+                return;
+            };
+            let mut state = state_of(&multisig);
+            apply_execute(&mut state, proposal_id).unwrap_or_else(|e| panic!("{e}"));
+            vec![AccountPostState::new(with_state(multisig.account, &state))]
+        }
+    };
 
-        apply_execute(&mut state, proposal_id)?;
-
-        multisig_account.account.data =
-            Data::try_from(borsh::to_vec(&state).map_err(|e| SpelError::SerializationError {
-                message: e.to_string(),
-            })?)
-            .map_err(|e| SpelError::SerializationError {
-                message: format!("state too large: {e:?}"),
-            })?;
-        Ok(SpelOutput::execute(vec![multisig_account], vec![]))
-    }
+    ProgramOutput::new(
+        self_program_id,
+        caller_program_id,
+        instruction_words,
+        pre_states,
+        post_states,
+    )
+    .write();
 }
