@@ -134,7 +134,9 @@ echo "member 1 voting account: Private/$VID1"
 echo "member 2 (never votes in this demo)"
 
 echo ""
-echo "=== [6/9] initialize 2-of-3 multisig + submit proposal ==="
+echo "=== [6/9] deploy program + initialize 2-of-3 multisig + submit proposal ==="
+"$MSIG" chain deploy --program-bin "$PROGRAM_BIN" || die "deploy failed"
+sleep 6   # local blocks are ~1s; give the deployment a few blocks to land
 KEYGEN=$("$MSIG" chain keygen)
 SIGNING_KEY=$(echo "$KEYGEN" | sed -n 's/^signing_key: //p')
 MULTISIG_ID=$(echo "$KEYGEN" | sed -n 's/^multisig_id: //p')
