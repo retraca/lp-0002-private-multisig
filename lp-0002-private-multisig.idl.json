@@ -1,245 +1,96 @@
 {
   "name": "private_multisig",
-  "version": "0.1.0",
+  "version": "0.2.0",
+  "metadata": {
+    "spec": "SPEL IDL",
+    "target": "Logos Execution Zone v0.2.0",
+    "notes": "Vote is the initial call of a privacy-preserving transaction; its args (incl. nsk) are private instruction data and never appear on-chain."
+  },
   "instructions": [
     {
       "name": "initialize",
       "accounts": [
-        {
-          "name": "multisig",
-          "isMut": true,
-          "isSigner": false
-        },
-        {
-          "name": "authority",
-          "isMut": false,
-          "isSigner": true
-        }
+        { "name": "multisig", "isMut": true, "isSigner": true, "docs": "Fresh account claimed by the program (signed once with its key, program-owned afterwards)." }
       ],
       "args": [
-        {
-          "name": "threshold",
-          "type": "u8"
-        },
-        {
-          "name": "vote_circuit_program_id",
-          "type": {
-            "array": [
-              "u32",
-              8
-            ]
-          }
-        },
-        {
-          "name": "member_commitments",
-          "type": {
-            "vec": {
-              "array": [
-                "u8",
-                32
-              ]
-            }
-          }
-        }
+        { "name": "threshold", "type": "u8" },
+        { "name": "commitments", "type": { "vec": { "array": ["u8", 32] } }, "docs": "SHA256(\"member\" || nsk || multisig_id) per member." }
       ]
     },
     {
       "name": "submit_proposal",
       "accounts": [
-        {
-          "name": "multisig",
-          "isMut": true,
-          "isSigner": false
-        }
+        { "name": "multisig", "isMut": true, "isSigner": false }
       ],
       "args": [
-        {
-          "name": "proposal_id",
-          "type": {
-            "array": [
-              "u8",
-              32
-            ]
-          }
-        },
-        {
-          "name": "action_bytes",
-          "type": "bytes"
-        }
+        { "name": "proposal_id", "type": { "array": ["u8", 32] } },
+        { "name": "action", "type": "bytes", "docs": "Opaque action bytes: the parameter change this proposal gates." }
       ]
     },
     {
       "name": "vote",
+      "privacy": "privacy-preserving transaction (initial call); all args are private witnesses",
       "accounts": [
-        {
-          "name": "multisig",
-          "isMut": true,
-          "isSigner": false
-        }
+        { "name": "multisig", "isMut": true, "isSigner": false, "docs": "Public pre/post state (mask 0)." },
+        { "name": "rider", "isMut": true, "isSigner": false, "docs": "The member's LIVE shielded voting account at AccountId::for_regular_private_account(npk(nsk), 0); asserted in-circuit." }
       ],
       "args": [
-        {
-          "name": "proposal_id",
-          "type": {
-            "array": [
-              "u8",
-              32
-            ]
-          }
-        },
-        {
-          "name": "journal_bytes",
-          "type": "bytes"
-        }
-      ],
-      "docs": [
-        "Callable only as a chained call from the registered vote-circuit program (PPE pipeline)."
+        { "name": "nsk", "type": { "array": ["u8", 32] }, "docs": "PRIVATE: the member's shielded-account nullifier secret key." },
+        { "name": "member_index", "type": "u32" },
+        { "name": "proposal_id", "type": { "array": ["u8", 32] } }
       ]
     },
     {
       "name": "execute",
       "accounts": [
-        {
-          "name": "multisig",
-          "isMut": true,
-          "isSigner": false
-        }
+        { "name": "multisig", "isMut": true, "isSigner": false }
       ],
       "args": [
-        {
-          "name": "proposal_id",
-          "type": {
-            "array": [
-              "u8",
-              32
-            ]
-          }
-        }
+        { "name": "proposal_id", "type": { "array": ["u8", 32] } }
       ]
     }
   ],
   "accounts": [
     {
       "name": "MultisigState",
+      "encoding": "borsh",
       "type": {
         "kind": "struct",
         "fields": [
-          {
-            "name": "threshold",
-            "type": "u8"
-          },
-          {
-            "name": "vote_circuit_program_id",
-            "type": {
-              "array": [
-                "u32",
-                8
-              ]
-            }
-          },
-          {
-            "name": "member_commitments",
-            "type": {
-              "vec": {
-                "array": [
-                  "u8",
-                  32
-                ]
-              }
-            }
-          },
-          {
-            "name": "proposals",
-            "type": {
-              "vec": {
-                "defined": "Proposal"
-              }
-            }
-          }
+          { "name": "threshold", "type": "u8" },
+          { "name": "member_commitments", "type": { "vec": { "array": ["u8", 32] } } },
+          { "name": "proposals", "type": { "vec": { "defined": "Proposal" } } }
         ]
       }
     },
     {
       "name": "Proposal",
+      "encoding": "borsh",
       "type": {
         "kind": "struct",
         "fields": [
-          {
-            "name": "id",
-            "type": {
-              "array": [
-                "u8",
-                32
-              ]
-            }
-          },
-          {
-            "name": "action_bytes",
-            "type": "bytes"
-          },
-          {
-            "name": "vote_count",
-            "type": "u8"
-          },
-          {
-            "name": "executed",
-            "type": "bool"
-          },
-          {
-            "name": "spent_nullifiers",
-            "type": {
-              "vec": {
-                "array": [
-                  "u8",
-                  32
-                ]
-              }
-            }
-          }
+          { "name": "id", "type": { "array": ["u8", 32] } },
+          { "name": "action_bytes", "type": "bytes" },
+          { "name": "vote_count", "type": "u8" },
+          { "name": "executed", "type": "bool" },
+          { "name": "spent_nullifiers", "type": { "vec": { "array": ["u8", 32] } } }
         ]
       }
     }
   ],
   "errors": [
-    {
-      "code": 6001,
-      "name": "ProofInvalid"
-    },
-    {
-      "code": 6002,
-      "name": "MultisigMismatch"
-    },
-    {
-      "code": 6003,
-      "name": "ProposalNotFound"
-    },
-    {
-      "code": 6004,
-      "name": "NullifierSpent"
-    },
-    {
-      "code": 6005,
-      "name": "MemberNotRegistered"
-    },
-    {
-      "code": 6006,
-      "name": "ProposalAlreadyExecuted"
-    },
-    {
-      "code": 6007,
-      "name": "ThresholdNotMet"
-    },
-    {
-      "code": 6008,
-      "name": "AlreadyInitialized"
-    },
-    {
-      "code": 6009,
-      "name": "TooManyMembers"
-    },
-    {
-      "code": 6010,
-      "name": "InvalidThreshold"
-    }
+    { "code": 6001, "name": "ProofInvalid", "msg": "multisig state deserialize failed" },
+    { "code": 6002, "name": "MultisigMismatch", "msg": "multisig id mismatch" },
+    { "code": 6003, "name": "ProposalNotFound", "msg": "proposal not found" },
+    { "code": 6004, "name": "NullifierSpent", "msg": "nullifier already spent (double vote)" },
+    { "code": 6005, "name": "MemberNotRegistered", "msg": "nsk does not match registered commitment / index out of range" },
+    { "code": 6006, "name": "ProposalAlreadyExecuted", "msg": "proposal already executed" },
+    { "code": 6007, "name": "ThresholdNotMet", "msg": "threshold not met" },
+    { "code": 6008, "name": "AlreadyInitialized", "msg": "multisig account already initialized / duplicate proposal id" },
+    { "code": 6009, "name": "TooManyMembers", "msg": "more than MAX_MEMBERS commitments" },
+    { "code": 6010, "name": "InvalidThreshold", "msg": "threshold must be 1..=N" },
+    { "code": 6011, "name": "TooManyProposals", "msg": "more than MAX_PROPOSALS proposals" },
+    { "code": 6012, "name": "RiderMismatch", "msg": "rider is not the voting account derived from this nsk" },
+    { "code": 6013, "name": "RiderNotLive", "msg": "rider must be a live shielded account" }
   ]
 }

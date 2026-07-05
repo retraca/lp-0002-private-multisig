@@ -24,3 +24,5 @@ lee = { git = "https://github.com/logos-blockchain/logos-execution-zone.git", ta
 lee_core = { git = "https://github.com/logos-blockchain/logos-execution-zone.git", tag = "v0.2.0", features = ["host"] }
 sequencer_service_rpc = { git = "https://github.com/logos-blockchain/logos-execution-zone.git", tag = "v0.2.0", features = ["client"] }
 wallet = { git = "https://github.com/logos-blockchain/logos-execution-zone.git", tag = "v0.2.0" }
+risc0-binfmt = "3.0.5"
+risc0-zkos-v1compat = "3.0.5"

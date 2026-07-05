@@ -149,6 +149,15 @@ fn hex32(s: &str) -> Result<[u8; 32]> {
 
 fn load_program(path: &str) -> Result<Program> {
     let bytecode = std::fs::read(path).with_context(|| format!("read {path}"))?;
+    // Accept either a deployable ProgramBinary or a raw guest ELF (as produced
+    // by `cargo +risc0 build --target riscv32im-risc0-zkvm-elf`); a raw ELF is
+    // wrapped with the standard risc0 v1compat kernel, which is exactly what
+    // `risc0_build::embed_methods` does.
+    let bytecode = if bytecode.starts_with(b"\x7fELF") {
+        risc0_binfmt::ProgramBinary::new(&bytecode, risc0_zkos_v1compat::V1COMPAT_ELF).encode()
+    } else {
+        bytecode
+    };
     Program::new(bytecode.into()).map_err(|e| anyhow!("load program: {e}"))
 }
 
