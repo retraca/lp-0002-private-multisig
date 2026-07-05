@@ -1,7 +1,7 @@
 {
   "name": "private_multisig",
-  "version": "0.1.0",
-  "description": "LP-0002 private M-of-N multisig: shielded member voting with ZK receipts on LEZ",
+  "version": "0.2.0",
+  "description": "LP-0002 private M-of-N multisig: anonymous M-of-N voting on LEZ v0.2.0: live state, commitments, vote commands",
   "author": "retraca",
   "type": "mini-app",
   "category": "governance",

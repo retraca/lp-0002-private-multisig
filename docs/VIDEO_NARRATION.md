@@ -1,78 +1,106 @@
-# LP-0002 demo video — narration script
+# LP-0002 Demo Video — Narration Script
 
-Read this over the silent terminal recording (`lp0002-demo.mp4`). The terminal
-shows only commands and results — all the explaining is your voice. Each
-section below is keyed to what's on screen at that moment, so you narrate what
-the viewer is actually seeing. Speak in your own words; this is a guide.
-
-The prize requires *your* narration ("a silent screencast is not sufficient"),
-so the voice track is what makes this a valid submission.
+One narration block per on-screen step. The recording is the real `./demo.sh`
+run (RISC0_DEV_MODE=0, local standalone LEZ v0.2.0 sequencer) plus a testnet
+segment. Speak each block as its step banner appears; the video's idle gaps
+are compressed, so keep the pace natural and let the output breathe.
 
 ---
 
-## Opening — while the header line is on screen
+**Intro (title card / step 1 banner)**
 
-"This is LP-0002, a private multisig for the Logos Execution Zone. A normal
-on-chain multisig leaks who the members are and exactly who approved each
-action. This one keeps votes private: the chain learns a threshold was
-reached, never which members voted. Everything here is the live testnet with
-real zero-knowledge proofs — dev mode is off."
+Hi, I'm Gonçalo. This is my submission for Lambda Prize LP-0002 — a private
+M-of-N multisig for the Logos Execution Zone. Members hold shielded accounts,
+approvals leave no trace of who voted, and the chain records only that a
+threshold was met. Everything you'll see is real: a real local LEZ v0.2.0
+sequencer, and real RISC0 proofs — RISC0_DEV_MODE is zero, and you'll see the
+prover output on screen.
 
-## "create the multisig account" — over `chain keygen`
+**Step 1-2 — build**
 
-"First I create the multisig's account key. On Logos, claiming a fresh account
-needs a signature from its own key, so this is a one-time bootstrap — after
-the account exists, the program owns it and the key isn't needed again."
+The demo script is the same one in the repo root that evaluators run from a
+clean clone. It builds the LEZ v0.2.0 standalone sequencer and wallet from
+the upstream tag, then my program — a single RISC0 guest with four
+instructions — plus the client CLI.
 
-## "each member derives a commitment" — over the three derive-commitment lines
+**Step 3 — boot the sequencer**
 
-"Each of the three members turns their secret key into a public commitment.
-This is the only step that touches a secret, and it's local — the secret key
-never goes on chain and is never sent anywhere. Only these commitments are
-shared."
+A throwaway local sequencer boots on a fresh data directory with
+RISC0_DEV_MODE=0 — it verifies real STARKs. One-second blocks.
 
-## "create the 2-of-3 multisig on-chain" — over `chain initialize` + state line
+**Step 4 — genesis funder**
 
-"Now I initialize the two-of-three multisig: the threshold, the three
-commitments, and the program allowed to deliver votes. It confirms, and the
-decoded state shows threshold two, zero votes so far."
+The wallet imports the genesis account that LEZ v0.2.0 bakes into its initial
+state. It funds the members' voting accounts in a minute.
 
-## "anyone can propose" — over `submit-proposal` + state line
+**Step 5 — member identities**
 
-"Anyone can submit a proposal — here, transfer one hundred. Submitting is
-open; only reaching the threshold of approvals will let it execute."
+Three members derive voting identities. The key detail: each member's secret
+is their shielded account's nullifier secret key, HD-derived exactly the way
+a LEZ wallet derives it. Controlling the secret is controlling the shielded
+account — that's what binds membership to real shielded accounts.
 
-## "member 0 votes" — over the vote command and the "Proving…" lines
+**Step 6 — deploy, initialize, propose**
 
-"Now a member votes. Their client runs a small vote-circuit program and proves
-it locally. The secret key goes in as a private input that never appears on
-chain. This 'Proving' line is a real zero-knowledge proof generating right
-now — it takes a few minutes. When it lands, the count goes to one, and the
-chain has no idea which of the three members voted."
+The program deploys, and the multisig initializes as 2-of-3. What goes
+on-chain is only the threshold and three one-way commitments — a hash of each
+member's secret and the multisig id. Then a proposal: a parameter change,
+"set fee_bps = 25", recorded on the program-owned account. No signatures
+needed from here on — the account belongs to the program.
 
-## "member 1 votes" — over the second vote + state line
+**Step 7 — fund the voting accounts**
 
-"A second member votes the same way — another real proof. The count reaches
-two, so the threshold is met. Each vote also creates a throwaway private note,
-so on chain a vote is indistinguishable from any ordinary private transfer."
+Each voting member needs their shielded voting account live on chain — this
+is the in-circuit live-account binding. Two shielded transfers, each a real
+proof, make member 0 and member 1's accounts live.
 
-## "threshold met — execute" — over `execute` + final state line
+**Step 8a — the first anonymous vote**
 
-"With two approvals in, anyone can execute. The state flips to executed, with
-two spent nullifiers — which is also what stops any member from voting twice."
+Member 0 votes. Watch what's happening: the vote is a privacy-preserving
+transaction proved locally. The secret key and the member index are private
+inputs — they never leave this machine. In-circuit, the program checks the
+membership commitment, checks the vote rides the member's live shielded
+account, and derives a nullifier bound to this proposal. This is a real
+STARK — here's the prover running. [pause while cycles print]
+The vote lands: count is one. The chain shows a nullifier — not who voted.
 
-## Closing — over the final two `#` lines
+**Step 8b — kill the sequencer**
 
-"That's the whole lifecycle: created, proposed, approved by two of three
-members privately, and executed — real proofs, live testnet, and the chain
-never learned who voted. The code, every transaction hash, and a one-command
-reproduction are in the repository. Thanks for watching."
+Reliability check: kill dash nine the sequencer mid-flow, restart it on the
+same data directory. The partial approval — one of two — survived. Approvals
+live on-chain, so members can stop and resume across any client or sequencer
+restart.
 
----
+**Step 8c — the second vote, threshold**
 
-## Recording your voice
+Member 1 votes the same way. Count reaches two — that's the threshold.
 
-Simplest path on macOS: open `lp0002-demo.mp4`, start a QuickTime screen
-recording (capture the playing video + your mic), and talk through the above.
-The two proof steps hold for a while on screen, giving you room to explain.
-Send me the result and I'll attach it to the submission and reopen the PR.
+**Step 8d — double vote rejected**
+
+Now member 0 tries to vote again. Same member, same proposal — the program
+derives the same nullifier and aborts inside the circuit with error 6004.
+The proof cannot even be generated: an invalid vote never reaches the chain.
+
+**Step 9 — execute**
+
+With the threshold met, execute finalizes the proposal. The final state:
+votes two, executed true, two spent nullifiers, and the action bytes. At no
+point did the chain record which members approved — that's the whole point.
+
+**Testnet segment**
+
+The same program is deployed on the hosted LEZ testnet — here's the program
+id, the multisig instance, and the full lifecycle: proposal, two anonymous
+approvals with distinct nullifiers, and the execution, all re-queryable on
+testnet.lez.logos.co. Transaction hashes are in the repo's testnet evidence
+doc.
+
+**Close (criteria checklist card)**
+
+To recap against the prize criteria: anonymous approvals from shielded
+accounts, threshold verification without recording voters, nullifier
+double-vote prevention, unlinkable execution, client-side proving, a
+reproducible demo against a real sequencer at RISC0_DEV_MODE=0, resumable
+partial approvals, documented error codes, and the testnet deployment with
+evidence. The repo has the write-up, SDK, IDL, Basecamp app, and benchmarks.
+Thanks for reviewing.

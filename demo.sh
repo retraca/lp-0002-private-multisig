@@ -1,264 +1,217 @@
 #!/usr/bin/env bash
-# LP-0002 private M-of-N multisig end-to-end demo (2-of-3).
+# LP-0002 private M-of-N multisig — end-to-end demo (2-of-3) against a REAL
+# local LEZ v0.2.0 standalone sequencer.
 #
-# Offline mode (default): derives commitments, generates two vote proofs, verifies both.
-# Chain mode (--chain):   full on-chain lifecycle -- initialize, proposal, two votes
-#                         delivered as privacy-preserving transactions (chained-call
-#                         composition through the vote-circuit program), execute.
+# Default mode uses REAL RISC0 proofs (RISC0_DEV_MODE=0): each anonymous vote
+# is a genuine STARK proved client-side (several minutes each on a laptop).
 #
-# Usage:
-#   ./demo.sh [--dev] [--chain] [--sequencer <url>]
+#   ./demo.sh          # real proofs, the submission-grade run
+#   ./demo.sh --dev    # RISC0_DEV_MODE=1 (fake receipts) — fast logic run / CI
 #
-#   --dev        RISC0_DEV_MODE=1 (fast mock proofs, no ZK work)
-#   --chain      Run on-chain steps. Requires:
-#                  1. wallet deploy-program output path in PROGRAM_BIN (see below)
-#                  2. cargo build --release --features chain
-#                  3. A running sequencer (local docker or testnet)
+# Environment:
+#   LEZ_DIR   where the LEZ v0.2.0 checkout+build lives (default ./.lez;
+#             reused across runs — the first run builds it, ~30-60 min)
+#   PORT      local sequencer port (default 3040)
 #
-# Testnet:
-#   SEQUENCER=https://testnet.lez.logos.co ./demo.sh --dev --chain
+# The flow demonstrated (one step per prize criterion where possible):
+#   build -> boot sequencer -> import genesis funder -> derive 3 members
+#   -> initialize 2-of-3 -> submit proposal -> fund member voting accounts
+#   -> vote(member 0) [real proof] -> KILL + RESTART sequencer (resume check)
+#   -> vote(member 1) -> double-vote(member 0) MUST FAIL -> execute -> assert.
 
-set -euo pipefail
+set -uo pipefail
 
 DEV_MODE=0
-CHAIN_MODE=0
-SEQUENCER="${SEQUENCER:-http://127.0.0.1:3040}"
-for arg in "$@"; do
-  [ "$arg" = "--dev" ]   && DEV_MODE=1
-  [ "$arg" = "--chain" ] && CHAIN_MODE=1
+for arg in "${@:-}"; do
+  [ "$arg" = "--dev" ] && DEV_MODE=1
 done
+
+ROOT="$(cd "$(dirname "$0")" && pwd)"
+LEZ_DIR="${LEZ_DIR:-$ROOT/.lez}"
+PORT="${PORT:-3040}"
+D="$ROOT/.demo"
+LOG="$D/seq.log"
+DUST=5
 
 if [ "$DEV_MODE" = "1" ]; then
   export RISC0_DEV_MODE=1
-  echo "[demo] RISC0_DEV_MODE=1 (mock proofs, no ZK)"
+  echo "[demo] RISC0_DEV_MODE=1 (fake receipts — logic run)"
 else
-  echo "[demo] Real RISC0 proofs -- proof generation takes several minutes per vote"
+  export RISC0_DEV_MODE=0
+  echo "[demo] RISC0_DEV_MODE=0 (REAL proofs — several minutes per vote)"
 fi
 
-# Build target: add --features chain when running on-chain steps.
-if [ "$CHAIN_MODE" = "1" ]; then
-  BIN_FEATURES="--features chain"
-else
-  BIN_FEATURES=""
+SEQ_PID=""
+cleanup() { [ -n "$SEQ_PID" ] && kill "$SEQ_PID" 2>/dev/null; pkill -f "sequencer_service .*--port $PORT" 2>/dev/null; true; }
+trap cleanup EXIT
+die() { echo "FATAL: $*" >&2; echo "=== DEMO FAILED ==="; exit 1; }
+
+# Genesis funder baked into LEZ v0.2.0 testnet_initial_state (public account 0).
+FUNDER_KEY="10a26a9aec7d34b82364eeae45c5294dbb0a764b000b94eeb9b58511dc487c4d"
+
+# Deterministic demo member seeds (throwaway; never reuse outside the demo).
+SEED0="4c70303030326d656d626572303030302f64656d6f2f6e736b2f763030310000"
+SEED1="4c70303030326d656d626572303030312f64656d6f2f6e736b2f763030310000"
+SEED2="4c70303030326d656d626572303030322f64656d6f2f6e736b2f763030310000"
+PROPOSAL_ID="9f1c47a26bd80355e12a7c904fb61833cc056e2188da471902f35ba06de41172"
+ACTION="736574206665655f627073203d203235"   # "set fee_bps = 25" — the gated parameter change
+
+echo ""
+echo "=== [1/9] prerequisites + LEZ v0.2.0 (sequencer + wallet) ==="
+command -v cargo >/dev/null || die "cargo not on PATH (install rustup)"
+command -v python3 >/dev/null || die "python3 required"
+if [ ! -d "$LEZ_DIR" ]; then
+  git clone -q --depth 1 --branch v0.2.0 \
+    https://github.com/logos-blockchain/logos-execution-zone.git "$LEZ_DIR" \
+    || die "clone logos-execution-zone v0.2.0"
 fi
-
-BIN="./target/release/multisig"
-# Program binary from wallet deploy-program (override with PROGRAM_BIN env var).
-# Produced by: wallet deploy-program programs/multisig/target/.../private_multisig
-PROGRAM_BIN="${PROGRAM_BIN:-}"
-# Program ID from deploy step (set below; override if already deployed).
-PROGRAM_ID="${PROGRAM_ID:-}"
+( cd "$LEZ_DIR" \
+  && cargo build --release -p sequencer_service --features standalone 2>&1 | tail -2 \
+  && cargo build --release -p wallet 2>&1 | tail -2 ) || die "LEZ build failed"
+SEQ_BIN="$LEZ_DIR/target/release/sequencer_service"
+WALLET_BIN="$LEZ_DIR/target/release/wallet"
+[ -x "$SEQ_BIN" ] && [ -x "$WALLET_BIN" ] || die "missing LEZ binaries"
 
 echo ""
-echo "=== LP-0002 Private M-of-N Multisig Demo (2-of-3) ==="
-echo "Sequencer: $SEQUENCER"
+echo "=== [2/9] build multisig CLI + guest program ==="
+( cd "$ROOT" && cargo build --release -p private-multisig-cli 2>&1 | tail -2 ) || die "cli build"
+MSIG="$ROOT/target/release/multisig"
+( cd "$ROOT/programs/multisig" \
+  && cargo +risc0 build --release --target riscv32im-risc0-zkvm-elf 2>&1 | tail -2 ) \
+  || die "guest build (rustup toolchain 'risc0' required — see README)"
+PROGRAM_BIN="$ROOT/programs/multisig/target/riscv32im-risc0-zkvm-elf/release/private_multisig"
+[ -f "$PROGRAM_BIN" ] || die "guest ELF not produced"
+"$MSIG" chain program-id --program-bin "$PROGRAM_BIN"
+
 echo ""
+echo "=== [3/9] boot local standalone sequencer (RISC0_DEV_MODE=$RISC0_DEV_MODE) ==="
+pkill -f "sequencer_service .*--port $PORT" 2>/dev/null; sleep 1
+rm -rf "$D"; mkdir -p "$D/wallet"
+python3 - "$LEZ_DIR/lez/sequencer/service/configs/debug/sequencer_config.json" \
+          "$D/sequencer_config.json" "$D" <<'PY' || die "sequencer config"
+import json, sys
+src, dst, home = sys.argv[1], sys.argv[2], sys.argv[3]
+c = json.load(open(src))
+c["home"] = home
+c["block_create_timeout"] = "1s"
+json.dump(c, open(dst, "w"), indent=2)
+PY
+cat > "$D/wallet/wallet_config.json" <<JSON
+{"sequencer_addr":"http://127.0.0.1:$PORT","seq_poll_timeout":"30s","seq_tx_poll_max_blocks":25,"seq_poll_max_retries":25,"seq_block_poll_max_amount":300}
+JSON
+export LEE_WALLET_HOME_DIR="$D/wallet"
+RUST_LOG=info nohup "$SEQ_BIN" "$D/sequencer_config.json" --port "$PORT" > "$LOG" 2>&1 &
+SEQ_PID=$!
+for _ in $(seq 1 40); do (ss -ltn 2>/dev/null || netstat -an) | grep -q "$PORT" && break; sleep 1; done
+(ss -ltn 2>/dev/null || netstat -an) | grep -q "$PORT" || die "sequencer did not bind :$PORT"
+echo "sequencer up (pid $SEQ_PID)"
 
-echo "[1/7] Building..."
-# shellcheck disable=SC2086
-cargo build --release --bin multisig $BIN_FEATURES 2>&1 | tail -3
+w() { RUST_LOG=error "$WALLET_BIN" "$@"; }
+state() { "$MSIG" chain state --multisig-id "$MULTISIG_ID" 2>/dev/null; }
+votes_now() { state | grep -o 'votes=[0-9]*' | head -1 | cut -d= -f2; }
+wait_for() { # wait_for <seconds> <cmd...>
+  local n=$1; shift
+  for _ in $(seq 1 "$n"); do "$@" && return 0; sleep 2; done
+  return 1
+}
 
-# Multisig account: in chain mode the account is claimed by the program at
-# initialize, which requires the tx to be signed with the account's key.
-# Generate a fresh key and derive the multisig ID from it.
-if [ "$CHAIN_MODE" = "1" ]; then
-  KEYGEN_OUT=$("$BIN" chain keygen 2>/dev/null || true)
-  if [ -z "$KEYGEN_OUT" ]; then
-    # binary not built with chain yet; build then retry after [1/7]
-    cargo build --release --bin multisig --features chain 2>&1 | tail -1
-    KEYGEN_OUT=$("$BIN" chain keygen)
-  fi
-  SIGNING_KEY=$(echo "$KEYGEN_OUT" | grep '^signing_key:' | awk '{print $2}')
-  MULTISIG_ID=$(echo "$KEYGEN_OUT" | grep '^multisig_id:' | awk '{print $2}')
-  echo "Multisig account: $MULTISIG_ID (fresh key, demo only)"
-else
-  # Offline mode: deterministic ID (no on-chain claiming happens)
-  MULTISIG_ID="cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+echo ""
+echo "=== [4/9] wallet: init storage + import genesis funder ==="
+printf 'demo\n' | w account list >/dev/null 2>&1 || true
+w account import public --private-key "$FUNDER_KEY" >/dev/null 2>&1 || true
+FUNDER_ID=$(w account list 2>/dev/null | grep -o 'Public/[1-9A-HJ-NP-Za-km-z]*' | head -1 | cut -d/ -f2)
+[ -n "$FUNDER_ID" ] || die "funder import failed"
+echo "funder: Public/$FUNDER_ID"
+
+echo ""
+echo "=== [5/9] members: derive 3 voting identities (nsk = shielded account key) ==="
+M0=$("$MSIG" member new --seed "$SEED0"); M1=$("$MSIG" member new --seed "$SEED1"); M2=$("$MSIG" member new --seed "$SEED2")
+NSK0=$(echo "$M0" | sed -n 's/^nsk: //p'); VID0=$(echo "$M0" | sed -n 's|^voting_account: Private/||p')
+NSK1=$(echo "$M1" | sed -n 's/^nsk: //p'); VID1=$(echo "$M1" | sed -n 's|^voting_account: Private/||p')
+NSK2=$(echo "$M2" | sed -n 's/^nsk: //p')
+echo "member 0 voting account: Private/$VID0"
+echo "member 1 voting account: Private/$VID1"
+echo "member 2 (never votes in this demo)"
+
+echo ""
+echo "=== [6/9] deploy program + initialize 2-of-3 multisig + submit proposal ==="
+"$MSIG" chain deploy --program-bin "$PROGRAM_BIN" || die "deploy failed"
+sleep 6   # local blocks are ~1s; give the deployment a few blocks to land
+KEYGEN=$("$MSIG" chain keygen)
+SIGNING_KEY=$(echo "$KEYGEN" | sed -n 's/^signing_key: //p')
+MULTISIG_ID=$(echo "$KEYGEN" | sed -n 's/^multisig_id: //p')
+echo "multisig account: $MULTISIG_ID"
+C0=$("$MSIG" derive-commitment --nsk "$NSK0" --multisig-id "$MULTISIG_ID")
+C1=$("$MSIG" derive-commitment --nsk "$NSK1" --multisig-id "$MULTISIG_ID")
+C2=$("$MSIG" derive-commitment --nsk "$NSK2" --multisig-id "$MULTISIG_ID")
+"$MSIG" chain initialize --program-bin "$PROGRAM_BIN" --signing-key "$SIGNING_KEY" \
+  --threshold 2 --commitments "$C0,$C1,$C2" || die "initialize failed"
+wait_for 60 sh -c "\"$MSIG\" chain state --multisig-id $MULTISIG_ID 2>/dev/null | grep -q 'threshold: 2'" \
+  || die "initialize did not land"
+echo "initialized (threshold 2, 3 members)"
+"$MSIG" chain submit-proposal --program-bin "$PROGRAM_BIN" --multisig-id "$MULTISIG_ID" \
+  --proposal-id "$PROPOSAL_ID" --action "$ACTION" || die "submit-proposal failed"
+wait_for 60 sh -c "\"$MSIG\" chain state --multisig-id $MULTISIG_ID 2>/dev/null | grep -q 'proposal $PROPOSAL_ID'" \
+  || die "proposal did not land"
+state
+
+echo ""
+echo "=== [7/9] fund member voting accounts (the in-circuit LIVE riders) ==="
+"$MSIG" member import --seed "$SEED0" >/dev/null || die "import member 0"
+"$MSIG" member import --seed "$SEED1" >/dev/null || die "import member 1"
+w auth-transfer send --from "Public/$FUNDER_ID" --to "Private/$VID0" --amount "$DUST" \
+  || die "fund member 0 voting account"
+w auth-transfer send --from "Public/$FUNDER_ID" --to "Private/$VID1" --amount "$DUST" \
+  || die "fund member 1 voting account"
+echo "voting accounts live on chain"
+
+echo ""
+echo "=== [8/9] anonymous votes: prove locally, nsk never leaves this machine ==="
+echo "--- vote as member 0 (RISC0_DEV_MODE=$RISC0_DEV_MODE)"
+"$MSIG" chain vote --program-bin "$PROGRAM_BIN" --multisig-id "$MULTISIG_ID" \
+  --proposal-id "$PROPOSAL_ID" --nsk "$NSK0" --member-index 0 || die "vote(member 0) failed"
+wait_for 90 sh -c "[ \"\$(\"$MSIG\" chain state --multisig-id $MULTISIG_ID 2>/dev/null | grep -o 'votes=[0-9]*' | head -1 | cut -d= -f2)\" = 1 ]" \
+  || die "vote 0 did not land"
+echo "votes=1"
+
+echo "--- RESUME CHECK: kill -9 the sequencer, restart on the same data dir"
+kill -9 "$SEQ_PID" 2>/dev/null; sleep 2
+RUST_LOG=info nohup "$SEQ_BIN" "$D/sequencer_config.json" --port "$PORT" >> "$LOG" 2>&1 &
+SEQ_PID=$!
+wait_for 40 sh -c "(ss -ltn 2>/dev/null || netstat -an) | grep -q $PORT" || die "sequencer restart"
+sleep 2
+[ "$(votes_now)" = "1" ] || die "partial approvals lost across restart"
+echo "partial approval (1 of 2) SURVIVED the restart — resumable"
+
+echo "--- vote as member 1"
+"$MSIG" chain vote --program-bin "$PROGRAM_BIN" --multisig-id "$MULTISIG_ID" \
+  --proposal-id "$PROPOSAL_ID" --nsk "$NSK1" --member-index 1 || die "vote(member 1) failed"
+wait_for 90 sh -c "[ \"\$(\"$MSIG\" chain state --multisig-id $MULTISIG_ID 2>/dev/null | grep -o 'votes=[0-9]*' | head -1 | cut -d= -f2)\" = 2 ]" \
+  || die "vote 1 did not land"
+echo "votes=2 (threshold reached)"
+
+echo "--- DOUBLE VOTE: member 0 votes again — the proof MUST fail (ERR_6004)"
+if "$MSIG" chain vote --program-bin "$PROGRAM_BIN" --multisig-id "$MULTISIG_ID" \
+  --proposal-id "$PROPOSAL_ID" --nsk "$NSK0" --member-index 0 2>"$D/double.err"; then
+  die "double vote was ACCEPTED — nullifier check broken"
 fi
-
-# Three members with deterministic test nsks (never use outside demo)
-NSK_1="1111111111111111111111111111111111111111111111111111111111111111"
-NSK_2="2222222222222222222222222222222222222222222222222222222222222222"
-NSK_3="3333333333333333333333333333333333333333333333333333333333333333"
+grep -o "ERR_6004[^\"]*" "$D/double.err" | head -1 || tail -2 "$D/double.err"
+echo "double vote rejected in-circuit (nullifier spent)"
 
 echo ""
-echo "[2/7] Deriving member commitments (nsk stays local, never sent anywhere)..."
-COMMIT_1=$("$BIN" derive-commitment --nsk "$NSK_1" --multisig-id "$MULTISIG_ID")
-COMMIT_2=$("$BIN" derive-commitment --nsk "$NSK_2" --multisig-id "$MULTISIG_ID")
-COMMIT_3=$("$BIN" derive-commitment --nsk "$NSK_3" --multisig-id "$MULTISIG_ID")
-echo "Member 0: $COMMIT_1"
-echo "Member 1: $COMMIT_2"
-echo "Member 2: $COMMIT_3"
-
-PROPOSAL_ID="aaaa000000000000000000000000000000000000000000000000000000000001"
-MEMBER_COMMITMENTS="$COMMIT_1,$COMMIT_2,$COMMIT_3"
+echo "=== [9/9] execute the threshold-gated action ==="
+"$MSIG" chain execute --program-bin "$PROGRAM_BIN" --multisig-id "$MULTISIG_ID" \
+  --proposal-id "$PROPOSAL_ID" || die "execute failed"
+wait_for 60 sh -c "\"$MSIG\" chain state --multisig-id $MULTISIG_ID 2>/dev/null | grep -q 'executed=true'" \
+  || die "execute did not land"
+state
 
 echo ""
-if [ "$CHAIN_MODE" = "1" ]; then
-  echo "[3/7] Deploying program + initializing multisig on-chain..."
-  if [ -z "$PROGRAM_ID" ] && [ -n "$PROGRAM_BIN" ]; then
-    echo "  Deploying program binary: $PROGRAM_BIN"
-    PROGRAM_ID=$(wallet deploy-program "$PROGRAM_BIN" | grep -oE '[0-9a-f]{64}' | head -1)
-    echo "  Program ID: $PROGRAM_ID"
-  elif [ -z "$PROGRAM_ID" ]; then
-    echo "  Using testnet program IDs (deployed, see docs/TESTNET_EVIDENCE.md)"
-    PROGRAM_ID="${PROGRAM_ID:-fb2d6afe695b3d03736f6a7f869d980884afc61f24d5199194f0891555a8a8e3}"
-  fi
-  VOTE_CIRCUIT_PROGRAM_ID="${VOTE_CIRCUIT_PROGRAM_ID:-7af8104a46999ed81962d5eb0dc4482db84a1352bacc95e86210fe1a46f87063}"
-  TX=$("$BIN" chain initialize \
-    --sequencer "$SEQUENCER" \
-    --program-id "$PROGRAM_ID" \
-    --vote-circuit-program-id "$VOTE_CIRCUIT_PROGRAM_ID" \
-    --signing-key "$SIGNING_KEY" \
-    --threshold 2 \
-    --commitments "$MEMBER_COMMITMENTS" | grep '^tx:' | awk '{print $2}')
-  echo "  Initialize tx: $TX"
-  echo "  Waiting for inclusion..."
-  INITIALIZED=0
-  for i in $(seq 1 24); do
-    STATE=$("$BIN" chain state --sequencer "$SEQUENCER" --multisig-id "$MULTISIG_ID" 2>/dev/null || true)
-    if echo "$STATE" | grep -q "program_owner: $PROGRAM_ID"; then INITIALIZED=1; break; fi
-    sleep 5
-  done
-  "$BIN" chain state --sequencer "$SEQUENCER" --multisig-id "$MULTISIG_ID"
-  if [ "$INITIALIZED" != "1" ]; then
-    echo "ERROR: initialize did not land (is program $PROGRAM_ID deployed on this sequencer?)" >&2
-    exit 1
-  fi
-
-  echo ""
-  echo "  Submitting proposal (unsigned: the account is now program-owned)..."
-  TX=$("$BIN" chain submit-proposal \
-    --sequencer "$SEQUENCER" \
-    --program-id "$PROGRAM_ID" \
-    --multisig-id "$MULTISIG_ID" \
-    --proposal-id "$PROPOSAL_ID" \
-    --action "7472616e73666572203130300a")
-  echo "  Proposal tx: $TX"
-  echo "  Waiting for inclusion..."
-  PROPOSED=0
-  for i in $(seq 1 24); do
-    if "$BIN" chain state --sequencer "$SEQUENCER" --multisig-id "$MULTISIG_ID" 2>/dev/null \
-      | grep -q "${PROPOSAL_ID:0:8}"; then PROPOSED=1; break; fi
-    sleep 5
-  done
-  if [ "$PROPOSED" != "1" ]; then
-    echo "ERROR: proposal did not land" >&2
-    exit 1
-  fi
-else
-  echo "[3/7] On-chain init skipped (pass --chain to run on-chain steps)"
-  echo "      threshold=2, commitments=[$COMMIT_1, $COMMIT_2, ...]"
-fi
-
-echo ""
-echo "[4/7] Member 0 votes (proof generated locally, nsk never leaves this machine)..."
-"$BIN" vote \
-  --nsk "$NSK_1" \
-  --member-index 0 \
-  --multisig-id "$MULTISIG_ID" \
-  --proposal-id "$PROPOSAL_ID" \
-  --member-commitments "$MEMBER_COMMITMENTS" \
-  --out /tmp/vote0.bin
-
-echo ""
-echo "[5/7] Member 1 votes..."
-"$BIN" vote \
-  --nsk "$NSK_2" \
-  --member-index 1 \
-  --multisig-id "$MULTISIG_ID" \
-  --proposal-id "$PROPOSAL_ID" \
-  --member-commitments "$MEMBER_COMMITMENTS" \
-  --out /tmp/vote1.bin
-
-echo ""
-echo "[6/7] Verifying both receipts offline..."
-"$BIN" verify --receipt /tmp/vote0.bin --multisig-id "$MULTISIG_ID" --proposal-id "$PROPOSAL_ID"
-"$BIN" verify --receipt /tmp/vote1.bin --multisig-id "$MULTISIG_ID" --proposal-id "$PROPOSAL_ID"
-
-echo ""
-if [ "$CHAIN_MODE" = "1" ]; then
-  echo "[7/7] Casting votes on-chain (privacy-preserving transactions) and executing..."
-  echo ""
-  echo "  Each vote runs the vote-circuit program locally with the nsk as a"
-  echo "  PRIVATE input, chains the call into the multisig program, and submits"
-  echo "  one composite proof. The nsk never leaves this machine."
-  echo ""
-  TX=$("$BIN" chain vote \
-    --sequencer "$SEQUENCER" \
-    --program-id "$PROGRAM_ID" \
-    --multisig-id "$MULTISIG_ID" \
-    --proposal-id "$PROPOSAL_ID" \
-    --nsk "$NSK_1" \
-    --member-index 0 | grep '^tx:' | awk '{print $2}')
-  echo "  Vote 0 tx: $TX"
-  # Wait for vote 0 to land before proving vote 1: each vote's proof commits
-  # to the multisig pre-state, so votes must be sequential.
-  echo "  Waiting for vote 0 to land..."
-  V0=0
-  for i in $(seq 1 24); do
-    if "$BIN" chain state --sequencer "$SEQUENCER" --multisig-id "$MULTISIG_ID" 2>/dev/null \
-      | grep -qE "data \(224 bytes\)"; then V0=1; break; fi
-    sleep 5
-  done
-  if [ "$V0" != "1" ]; then echo "ERROR: vote 0 did not land" >&2; exit 1; fi
-
-  TX=$("$BIN" chain vote \
-    --sequencer "$SEQUENCER" \
-    --program-id "$PROGRAM_ID" \
-    --multisig-id "$MULTISIG_ID" \
-    --proposal-id "$PROPOSAL_ID" \
-    --nsk "$NSK_2" \
-    --member-index 1 | grep '^tx:' | awk '{print $2}')
-  echo "  Vote 1 tx: $TX"
-
-  echo "  Waiting for vote 1 to land..."
-  V1=0
-  for i in $(seq 1 24); do
-    if "$BIN" chain state --sequencer "$SEQUENCER" --multisig-id "$MULTISIG_ID" 2>/dev/null \
-      | grep -qE "data \(256 bytes\)"; then V1=1; break; fi
-    sleep 5
-  done
-  if [ "$V1" != "1" ]; then echo "ERROR: vote 1 did not land" >&2; exit 1; fi
-
-  TX=$("$BIN" chain execute \
-    --sequencer "$SEQUENCER" \
-    --program-id "$PROGRAM_ID" \
-    --multisig-id "$MULTISIG_ID" \
-    --proposal-id "$PROPOSAL_ID" | grep '^tx:' | awk '{print $2}')
-  echo "  Execute tx: $TX"
-  echo "  Waiting for execution to land..."
-  EXECUTED=0
-  for i in $(seq 1 24); do
-    STATE=$("$BIN" chain state --sequencer "$SEQUENCER" --multisig-id "$MULTISIG_ID" 2>/dev/null || true)
-    # borsh tail: vote_count=02, executed=01, nullifier count=02000000
-    if echo "$STATE" | grep -q "020102000000"; then EXECUTED=1; break; fi
-    sleep 5
-  done
-  echo ""
-  echo "  Final multisig state (vote_count=2, executed=true, 2 spent nullifiers):"
-  "$BIN" chain state --sequencer "$SEQUENCER" --multisig-id "$MULTISIG_ID"
-  if [ "$EXECUTED" != "1" ]; then
-    echo "ERROR: proposal not executed on-chain" >&2
-    exit 1
-  fi
-else
-  echo "[7/7] On-chain submit skipped (pass --chain to run on-chain steps)"
-fi
-
-echo ""
-echo "=== Demo complete ==="
-echo "Vote receipts: /tmp/vote0.bin /tmp/vote1.bin"
-echo ""
-if [ "$CHAIN_MODE" = "0" ]; then
-  echo "To run the full on-chain demo:"
-  echo "  cargo build --release --features chain"
-  echo "  SEQUENCER=https://testnet.lez.logos.co ./demo.sh --dev --chain"
-fi
-echo ""
-echo "Privacy properties:"
-echo "  - nsk never leaves the client"
-echo "  - On-chain observers see that M proofs were accepted, not which members voted"
-echo "  - member_set_root binds the proof to the registered set without revealing the voter"
-echo "  - Per-proposal nullifiers prevent double-voting"
-echo "  - LEZ nonce constraint avoided: voting commitments are separate from shielded accounts"
+echo "=== DEMO PASSED ==="
+echo "2-of-3 lifecycle complete on a real local sequencer:"
+echo "  - 2 anonymous approvals (privacy-preserving txs, nsk client-side only)"
+echo "  - on-chain state shows votes=2 + 2 nullifiers, never WHICH members voted"
+echo "  - partial approval survived a sequencer kill -9 (resumable)"
+echo "  - double vote rejected in-circuit (ERR_6004)"
+echo "  - threshold-gated action executed"
+exit 0
