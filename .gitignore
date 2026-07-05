@@ -1,5 +1,5 @@
 target/
 
-# demo videos: local only, never committed
-docs/*.mp4
+# rendered demo gifs are local; the final submission mp4 IS committed (docs/lp0002-demo.mp4)
+
 *.gif
