@@ -1,19 +1,34 @@
 # Private Multisig — Basecamp App
 
-A Logos Basecamp mini-app for the LP-0002 private M-of-N multisig.
-
-## Load in Logos app (Basecamp)
-
-1. In the Logos desktop app, open the Basecamp module.
-2. Click **Load local app** and point it at this directory.
-3. The app loads `index.html` directly from the filesystem — no build step.
+A Logos Basecamp mini-app GUI for the LP-0002 private M-of-N multisig.
 
 ## What it does
 
-**Derive commitment** — enter your NSK and the multisig ID, get back your `member_commitment = SHA256("member" || nsk || multisig_id)`. Share the commitment with the multisig creator. The NSK never leaves the page.
+- **Live multisig state** — reads the multisig account from any LEZ sequencer
+  (`getAccount` JSON-RPC) and decodes the Borsh state client-side: threshold,
+  member count, and per-proposal votes / executed flag / nullifier count. The
+  page shows *that* a threshold was met, never *who* voted — same privacy
+  boundary as the chain itself.
+- **Derive commitment** — enter your NSK and the multisig ID, get back
+  `SHA256("member" || nsk || multisig_id)` computed with the Web Crypto API.
+  The NSK input is type `password` and never leaves the page.
+- **Vote command builder** — assembles the exact `multisig chain vote` CLI
+  invocation for your proposal/member. Vote proofs are real STARKs generated
+  by the CLI (RISC0_DEV_MODE=0); a browser cannot produce them.
 
-**Vote** — the page shows the CLI command to generate a vote receipt offline. Submit the receipt bytes to the on-chain `vote` instruction via the chain interface.
+## Local build instructions
 
-## Security note
+There is no build step — the app is a single self-contained `index.html`
+(vanilla JS + Web Crypto).
 
-This app computes commitments client-side in the browser using the Web Crypto API. The NSK input is type `password` and is never stored or transmitted.
+## Load in Logos app (Basecamp)
+
+1. Download `basecamp-app.zip` from this repository's GitHub release assets
+   (or use this directory directly from a clone) and unzip it.
+2. In the Logos desktop app, open the Basecamp module.
+3. Load the app directory as a local app (`module.json` describes it;
+   `index.html` is the entry point).
+
+It also runs in any browser: `open index.html` (state reads work against any
+sequencer URL you enter, e.g. `https://testnet.lez.logos.co` or a local
+`http://127.0.0.1:3040`).
