@@ -1,104 +1,82 @@
-# LP-0002 testnet deployment evidence
+# LP-0002 Testnet Deployment Evidence
 
-Date: 2026-06-12. Sequencer: `https://testnet.lez.logos.co` (hosted LEZ testnet). Explorer: `https://explorer.testnet.lez.logos.co`.
+Date: **2026-07-05** (22:20–22:42 UTC). Sequencer: `https://testnet.lez.logos.co`
+(hosted LEZ testnet, pinned to **LEZ v0.2.0**, tag commit `a58fbce2`). All
+proofs real: `RISC0_DEV_MODE=0`.
 
-All transactions below are verifiable with:
+> The 2026-06-12 v0.1.2 evidence that used to live in this file is
+> **superseded**: the hosted testnet was since wiped and redeployed on
+> LEZ v0.2.0, and the program was ported and redeployed (new program id).
+
+## Program
+
+| | |
+|---|---|
+| Program id | `6ce658db7384e1f6a90528715404856d55f2e977667d0a5989c8ed633d55afad` |
+| Deploy tx | `f37ac02deaabf5470450cc1f7f2643bfb5fc7d8de8f2783959b420a515959837` |
+| Source | `programs/multisig` @ branch HEAD (built with `cargo +risc0 build --release --target riscv32im-risc0-zkvm-elf`) |
+
+The program id is the RISC0 image id — recompute it from source with
+`multisig chain program-id --program-bin <elf>` and compare.
+
+## Multisig instance (2-of-3)
+
+| | |
+|---|---|
+| Multisig account | hex `9bcd3516c505db20d37051192c8a02a4b999a474754f0da42bfa6c247860f72c` = base58 `BVBgRAv7v2z9U13gxeKfEGogjjiAEnAhfVNabv6aUPQw` |
+| Initialize tx | `bb18ee5b1adb9f83f9ff3f875fc780479a7e62523d5b99710d5262727cb684a5` |
+| Threshold | 2 of 3 |
+
+## Members (demo identities — throwaway seeds, published for reproducibility)
+
+| Member | Voting account (live shielded rider) | Funding tx |
+|---|---|---|
+| 0 | `Private/Aova5zFCCeEwW7nskg5gD74STSwx2dmWp1poChdDHGft` | `a36411765b15998004b8e7e1a6f295810dc3e8d34ee0d8b6d66de162bb3918fc` |
+| 1 | `Private/AdyUtqkL7u2cDgtUx7N3ewrGkUrCqRz8zq4X8w9w53CL` | `dcf59b373819b51509a60f288e180bcf1a38e26f325fcba25c0217e765460e2b` |
+| 2 | `Private/FU7EH6EWRA175AsNEMW7bMgti5R8yvRDDsKnTVwAcdhW` | (never votes — threshold reached without them) |
+
+Funder: genesis public account `6iArKUXxhUJqS7kCaPNhwMWt3ro71PDyBj7jwAyE2VQV`
+(baked into LEZ v0.2.0 `testnet_initial_state`).
+
+## Proposal lifecycle (all on-chain, re-queryable)
+
+| Step | Tx hash |
+|---|---|
+| Submit proposal `7a11e7c47bd80355e12a7c904fb61833cc056e2188da471902f35ba06de40001` (action `set fee_bps = 25`) | `203edcaff500ef7f683263c818822a23a59d3c91e095e32d0534cedba5069c4a` |
+| Anonymous vote 1 (real STARK, privacy-preserving tx) | `b3a437b76f0573e00be7a772eecf5b8aa6480fabd083fb932478b489ae4fa8e7` |
+| Anonymous vote 2 (real STARK, privacy-preserving tx) | `4e0322d153838641f479f593650d44f3b30c1b3b3946365199b1fea9663254ca` |
+| Double-vote attempt by voter of vote 1 | **rejected in-circuit**: `Guest panicked: ERR_6004 nullifier already spent (double vote)` — the proof cannot be generated, no tx exists |
+| Execute (threshold 2 reached) | `cc8b134a0e1431b3f4c6ef8bbc442db90acd6825fe3e841846609c1f255ce874` |
+
+## Verify it yourself
+
+Final on-chain state (any machine, no tooling beyond curl + python):
 
 ```bash
 curl -s -X POST https://testnet.lez.logos.co -H 'Content-Type: application/json' \
-  -d '{"jsonrpc":"2.0","method":"getTransaction","params":["<tx_hash>"],"id":1}'
+  -d '{"jsonrpc":"2.0","id":1,"method":"getAccount","params":["BVBgRAv7v2z9U13gxeKfEGogjjiAEnAhfVNabv6aUPQw"]}'
 ```
 
-and the account state with:
+Decoded (as of 2026-07-05, via `sdk::decode_state` or the Basecamp app):
 
-```bash
-multisig chain state --sequencer https://testnet.lez.logos.co --multisig-id <hex>
+```
+program_owner: 6ce658db7384e1f6a90528715404856d55f2e977667d0a5989c8ed633d55afad
+threshold=2 members=3 proposals=1
+proposal 7a11e7c47bd80355… votes=2 executed=True action="set fee_bps = 25"
+nullifiers=[823c595053927ed2…, 4b7ae574da0494c4…]
 ```
 
-## 1. Program deployments
+Note what the state does NOT contain: any link between the two nullifiers and
+the three member commitments or voting accounts. The chain records that a
+threshold of 2 was met — not which members approved.
 
-| Program | Program ID | Deployment tx |
-|---|---|---|
-| `programs/multisig/private_multisig.bin` | `fb2d6afe695b3d03736f6a7f869d980884afc61f24d5199194f0891555a8a8e3` | `43703d962099e5ed7d6467e22fa11d60c2b67634c91cafe1388d639bd91ffc92` |
-| `programs/vote_circuit/vote_circuit.bin` | `7af8104a46999ed81962d5eb0dc4482db84a1352bacc95e86210fe1a46f87063` | `4924d2b9a6bd6c3b776b750344cb0d9bbdd7ddf972e7f73c56e011d2cd96f9f8` |
+Each tx: `{"method":"getTransaction","params":["<hash>"]}` on the same endpoint.
 
-## 2. Multisig instance (2-of-3): full lifecycle with REAL proofs
+## Reproduce the deployment
 
-Run at `RISC0_DEV_MODE=0` end to end. Demo member nsks `0x11…`, `0x22…`, `0x33…`.
-
-| Step | Value |
-|---|---|
-| Multisig account | `91e43105fd0fdf07b64d0dfd975063dca813bda832411692cd8227884147536a` |
-| Initialize tx (signed) | `b4c679341fd1b3298b48d1f3e07284d7547238fe26c8bebe71b7ee8bb8e35d6c` |
-| Proposal tx (`aaaa…01`, "transfer 100") | `3383acef3b9cf01d580d67d5259159388590dda6421e5aac9213668c5bd79f40` |
-| Vote 1 (privacy-preserving tx, member 0) | `1050f4f2efc76de225bdb8ab6b24958076a16e8cfbda68697fbf559f18598622` |
-| Vote 2 (privacy-preserving tx, member 1) | `74374c0125ca1613c025331bb5e046e6678bb73ca1a551a3868015a2f85c000f` |
-| Execute tx | `8f3c5b4581b4880243bc1bd3ac6a15ce6b8c395ec32595e9118470a69097b6f2` |
-
-Final state read back from the testnet decodes as `MultisigState { threshold: 2, vote_circuit_program_id: 7af8104a…, member_commitments: [3], proposals: [Proposal { id: aaaa…01, action: "transfer 100", vote_count: 2, executed: true, spent_nullifiers: [2] }] }`.
-
-## 3. How votes work on-chain (chained-call composition)
-
-LEZ public transactions carry no RISC0 receipts, so a program cannot resolve an
-`env::verify` assumption in public execution (`sys_verify_integrity: no receipt
-found`, reproduced against a local standalone sequencer). Votes therefore travel
-through the **privacy-preserving execution (PPE) pipeline**:
-
-1. The voter runs `multisig chain vote`. The CLI executes and proves the
-   **vote-circuit program** locally: the nsk is initial-call instruction data,
-   which never appears on-chain (the PPE output exposes only public pre/post
-   states, commitments, and nullifiers).
-2. The vote-circuit program recomputes
-   `member_commitment = SHA256("member" || nsk || multisig_id)` against the
-   registered set in live multisig state, derives the per-proposal nullifier
-   and member set root, and declares a `ChainedCall` into the multisig
-   program's `vote` instruction.
-3. The PPE outer circuit proves both program executions and their linkage
-   (caller_program_id cannot be spoofed). The multisig program accepts votes
-   only from the vote-circuit program registered at `initialize`.
-4. The sequencer verifies ONE composite succinct proof and applies the public
-   state diff. A vote transaction additionally creates a fresh zero-balance
-   private "voter note", giving it the same on-chain shape as any private
-   transfer.
-
-Negative paths verified against a local standalone sequencer (failures surface
-client-side during proving, before any transaction is sent):
-
-- Re-vote after execution → `Program error 6006: proposal already executed`
-  (observed live; the nullifier-spent path `6004` on an open proposal is
-  covered by the state-machine unit tests).
-- Non-member nsk → `Program error 6005: nsk does not match registered
-  commitment` (observed live).
-- Vote submitted as a plain public transaction → rejected: caller check fails
-  (`6012 ERR_UNAUTHORIZED_CALLER`), because top-level callers have the zeroed
-  caller program ID.
-
-## 4. Authorization model
-
-`#[account(init)]` account claiming requires the transaction to be authorized
-by the account's key: an unsigned initialize fails with
-`InvalidProgramBehavior(ClaimedUnauthorizedAccount)`. The CLI flow:
-
-1. `multisig chain keygen` generates a fresh schnorr (BIP340) key; the multisig
-   account ID is `SHA256("/LEE/v0.3/AccountId/Public/" || pubkey)`.
-2. `multisig chain initialize --signing-key <hex> …` fetches the nonce, signs,
-   and submits. The key is a one-time bootstrap credential; after claiming, the
-   account belongs to the program. Proposals, votes, and execution are
-   unsigned.
-
-## 5. Performance
-
-| Operation | Cost |
-|---|---|
-| `initialize` / `submit_proposal` / `execute` (public tx) | ~4-10 ms zkVM executor time on the sequencer (well under the 32M-cycle public execution budget) |
-| `chain vote` client-side proving (`RISC0_DEV_MODE=0`, Apple M2) | ~8-12 minutes (vote-circuit proof + multisig proof + PPE outer succinct proof) |
-| Vote verification on the sequencer | one succinct receipt verification (same cost as any privacy-preserving transaction) |
-
-## 6. Superseded v1 evidence
-
-An earlier program version (`9abec04f2a082b6bf70f5a38f2dc967cc7605b3159a6713d93e62f76b0a55725`,
-deploy tx `82de65cf312a272e3a2a81929d2fb0042b09c5b7ff9d1d225eb6682dcb235005`)
-used `env::verify` for votes and could not accept them via public transactions.
-Its instance (`6c0238c2…b424`, initialize tx `419ddedd…452c`, proposal tx
-`38faa9a3…023a`) remains on the testnet as historical evidence of the
-deployment path. The v2 architecture above supersedes it.
+`scripts/testnet-run.sh` (the exact script that produced this evidence) drives
+the full flow against the hosted testnet: build → deploy → keygen → initialize
+→ proposal → import + fund voting accounts → two anonymous votes → double-vote
+rejection → execute. Fresh ids each run: generate new member seeds
+(`multisig member new`) and a new proposal id, and fund from any spendable
+public account (`FUNDER_ID` env).
