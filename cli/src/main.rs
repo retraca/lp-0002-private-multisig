@@ -149,7 +149,7 @@ fn hex32(s: &str) -> Result<[u8; 32]> {
 
 fn load_program(path: &str) -> Result<Program> {
     let bytecode = std::fs::read(path).with_context(|| format!("read {path}"))?;
-    Program::new(bytecode).map_err(|e| anyhow!("load program: {e}"))
+    Program::new(bytecode.into()).map_err(|e| anyhow!("load program: {e}"))
 }
 
 fn program_id_hex(id: &ProgramId) -> String {
